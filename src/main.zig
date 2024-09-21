@@ -116,13 +116,37 @@ pub const ParseErrors = ParseError || Allocator.Error || std.fmt.ParseIntError |
 pub const ParserConfig = struct { parserType: ParserType = ParserType.rfc8259 };
 
 /// Enumerator for the JSON parser type.
-pub const ParserType = enum { rfc8259, json5 };
-
-/// The possible types of JSON values
-pub const JsonType = enum { object, array, string, integer, float, boolean, nil };
+pub const ParserType = enum {
+    rfc8259,
+    json5,
+};
 
 /// The type of encoding used for a JSON number
-const NumberEncoding = enum { integer, float, exponent, hex };
+const NumberEncoding = enum {
+    integer,
+    float,
+    exponent,
+    hex,
+};
+
+pub const JsonIndent = enum {
+    NO_LINE,
+    SPACES_2,
+    SPACES_4,
+    TABS,
+};
+
+fn serializerWriteIndent(writer: anytype, indentKind: JsonIndent, depth: usize) !void {
+    const indent = switch (indentKind) {
+        .NO_LINE => return,
+        .SPACES_2 => "  ",
+        .SPACES_4 => "    ",
+        .TABS => "\t",
+    };
+    for (0..depth) |_| {
+        try writer.writeAll(indent);
+    }
+}
 
 /// Abstraction for JSON objects
 pub const JsonObject = struct {
@@ -180,32 +204,25 @@ pub const JsonObject = struct {
         return self.map.keys();
     }
 
-    /// Print out the JSON object
-    /// TODO: Need to handle proper character escaping
-    pub fn print(self: *JsonObject, indent: ?usize) void {
-        std.debug.print("{{\n", .{});
-        var iv = if (indent) |v| v + 2 else 2;
-        for (self.map.keys(), 0..) |key, index| {
-            var i: usize = 0;
-            while (i < iv) : (i += 1) {
-                std.debug.print(" ", .{});
-            }
-            std.debug.print("\"{s}\": ", .{key});
-            const value = self.map.get(key);
-            if (value) |v| {
-                v.print(iv);
-            }
-            if (index < self.map.count() - 1) {
-                std.debug.print(",\n", .{});
-            }
-        }
-        iv -= 2;
-        std.debug.print("\n", .{});
+    /// Serialize the JSON object to a writer
+    pub fn serialize(self: *JsonObject, writer: anytype, indent: JsonIndent, depth: usize) !void {
+        try writer.writeAll("{");
+        if (indent != .NO_LINE) try writer.writeAll("\n");
+        var iter = self.map.iterator();
         var i: usize = 0;
-        while (i < iv) : (i += 1) {
-            std.debug.print(" ", .{});
+        const size = self.map.count();
+        while (iter.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const value = entry.value_ptr.*;
+            try serializerWriteIndent(writer, indent, depth + 1);
+            try writer.print("\"{s}\": ", .{key});
+            try value.serialize(writer, indent, depth + 1);
+            i += 1;
+            if (i < size) try writer.writeAll(",");
+            if (indent != .NO_LINE) try writer.writeAll("\n");
         }
-        std.debug.print("}}\n", .{});
+        try serializerWriteIndent(writer, indent, depth);
+        try writer.writeAll("}");
     }
 };
 
@@ -262,44 +279,35 @@ pub const JsonArray = struct {
         return self.getOrNull(0);
     }
 
-    /// Print the JSON array
-    pub fn print(self: *JsonArray, indent: ?usize) void {
-        std.debug.print("[\n", .{});
-        var iv = if (indent) |v| v + 2 else 2;
-        for (self.array.items, 0..) |item, index| {
-            var i: usize = 0;
-            while (i < iv) : (i += 1) {
-                std.debug.print(" ", .{});
-            }
-            item.print(iv);
-            if (index < self.len() - 1) {
-                std.debug.print(",\n", .{});
-            }
+    /// Serialize the JSON array to a writer
+    pub fn serialize(self: *JsonArray, writer: anytype, indent: JsonIndent, depth: usize) !void {
+        try writer.writeAll("[");
+        if (indent != .NO_LINE) try writer.writeAll("\n");
+        for (self.array.items, 0..) |value, index| {
+            try serializerWriteIndent(writer, indent, depth + 1);
+            try value.serialize(writer, indent, depth + 1);
+            if (index < self.array.items.len - 1) try writer.writeAll(",");
+            if (indent != .NO_LINE) try writer.writeAll("\n");
         }
-        std.debug.print("\n", .{});
-        iv -= 2;
-        var i: usize = 0;
-        while (i < iv) : (i += 1) {
-            std.debug.print(" ", .{});
-        }
-        std.debug.print("]\n", .{});
+        try serializerWriteIndent(writer, indent, depth);
+        try writer.writeAll("]");
     }
 };
 
-const JsonValueTypeUnion = union { integer: i64, float: f64, array: *JsonArray, string: []const u8, object: *JsonObject, boolean: bool };
+const JsonValueTypeUnion = union(enum) {
+    integer: i64,
+    float: f64,
+    array: *JsonArray,
+    string: []const u8,
+    object: *JsonObject,
+    boolean: bool,
+    nil: void,
+};
 
 /// Abstraction for all JSON values
 pub const JsonValue = struct {
-    /// The JSON value type
-    type: JsonType,
-
     /// The JSON value
-    value: ?JsonValueTypeUnion,
-
-    /// A pointer for the string value if we don't use a slice from the parsed
-    /// string. Presently we're always using this but we can step back for non
-    /// escaped strings that don't need to be transformed.
-    stringPtr: ?[]u8,
+    value: JsonValueTypeUnion,
 
     /// True if the instance of this JsonValue shouldn't be destroyed
     indestructible: bool = false,
@@ -310,17 +318,11 @@ pub const JsonValue = struct {
             return;
         }
 
-        if (self.value) |value| {
-            if (self.type == JsonType.object) {
-                value.object.deinit(allocator);
-            }
-            if (self.type == JsonType.array) {
-                value.array.deinit(allocator);
-            }
-            if (self.type == JsonType.string) {
-                if (self.stringPtr) |stringPtr|
-                    allocator.free(stringPtr);
-            }
+        switch (self.value) {
+            .object => |o| o.deinit(allocator),
+            .array => |a| a.deinit(allocator),
+            .string => |s| allocator.free(s),
+            else => {},
         }
 
         allocator.destroy(self);
@@ -328,109 +330,112 @@ pub const JsonValue = struct {
 
     /// Handy pass-thru to typed get(...) calls
     pub fn get(self: *JsonValue, index: anytype) *JsonValue {
-        if (self.value == null) {
-            @panic("Value is null");
-        }
-
-        return switch (self.type) {
+        return switch (self.value) {
             // Figure out a better way to do this
-            JsonType.object => if (@TypeOf(index) != usize and @TypeOf(index) != comptime_int) self.value.?.object.get(index) else @panic("Invalid key type"),
-            JsonType.array => if (@TypeOf(index) == usize or @TypeOf(index) == comptime_int) self.value.?.array.get(index) else @panic("Invalid key type"),
-            else => @panic("JsonType doesn't support get()"),
+            .object => |obj| if (@TypeOf(index) != usize and @TypeOf(index) != comptime_int) obj.get(index) else @panic("Invalid key type"),
+            .array => |arr| if (@TypeOf(index) == usize or @TypeOf(index) == comptime_int) arr.get(index) else @panic("Invalid key type"),
+            .nil => @panic("Cannot get() from a null value"),
+            else => |t| std.debug.panic("'{s}' type doesn't support get()", .{@tagName(t)}),
         };
     }
 
     /// Handy pass-thru to typed len(...) calls
     pub fn len(self: *JsonValue) usize {
-        if (self.value == null) {
-            @panic("Value is null");
-        }
-
-        return switch (self.type) {
+        return switch (self.value) {
             // Figure out a better way to do this
-            JsonType.object => self.value.?.object.len(),
-            JsonType.array => self.value.?.array.len(),
-            JsonType.string => self.value.?.string.len,
-            else => @panic("JsonType doesn't support len()"),
+            .object => |obj| obj.len(),
+            .array => |arr| arr.len(),
+            .string => |str| str.len,
+            else => |t| std.debug.panic("'{s}' type doesn't support len()", .{@tagName(t)}),
         };
     }
 
     /// Returns the string value or panics
     pub fn string(self: *JsonValue) []const u8 {
-        if (self.value == null) @panic("Value is null");
-        return if (self.type == JsonType.string) self.value.?.string else @panic("Not a string");
+        return if (self.value == .string) self.value.string else @panic("Not a string");
     }
 
     /// Returns the object value or panics
     pub fn object(self: *JsonValue) *JsonObject {
-        if (self.value == null) @panic("Value is null");
-        return if (self.type == JsonType.object) self.value.?.object else @panic("Not an object");
+        return if (self.value == .object) self.value.object else @panic("Not an object");
     }
 
     /// Returns the integer value or panics
     pub fn integer(self: *JsonValue) i64 {
-        if (self.value == null) @panic("Value is null");
-        return if (self.type == JsonType.integer) self.value.?.integer else @panic("Not an number");
+        return if (self.value == .integer) self.value.integer else @panic("Not an number");
     }
 
     /// Returns the float value or panics
     pub fn float(self: *JsonValue) f64 {
-        if (self.value == null) @panic("Value is null");
-        return if (self.type == JsonType.float) self.value.?.float else @panic("Not an float");
+        return if (self.value == .float) self.value.float else @panic("Not an float");
     }
 
     /// Returns the array value or panics
     pub fn array(self: *JsonValue) *JsonArray {
-        if (self.value == null) @panic("Value is null");
-        return if (self.type == JsonType.array) self.value.?.array else @panic("Not an array");
+        return if (self.value == .array) self.value.array else @panic("Not an array");
     }
 
     /// Returns the array value or panics
     pub fn boolean(self: *JsonValue) bool {
-        if (self.value == null) @panic("Value is null");
-        return if (self.type == JsonType.boolean) self.value.?.boolean else @panic("Not a boolean");
+        return if (self.value == .boolean) self.value.boolean else @panic("Not a boolean");
     }
 
     /// Returns the string value or null
     pub fn stringOrNull(self: *JsonValue) ?[]const u8 {
-        return if (self.type == JsonType.string) self.value.string else null;
+        return if (self.value == .string) self.value.string else null;
     }
 
     /// Returns the object value or null
     pub fn objectOrNull(self: *JsonValue) ?*JsonObject {
-        return if (self.type == JsonType.object) self.value.object else null;
+        return if (self.value == .object) self.value.object else null;
     }
 
     /// Returns the integer value or null
     pub fn integerOrNull(self: *JsonValue) ?i64 {
-        return if (self.type == JsonType.integer) self.value.integer else null;
+        return if (self.value == .integer) self.value.integer else null;
     }
 
     /// Returns the float value or null
     pub fn floatOrNull(self: *JsonValue) ?f64 {
-        return if (self.type == JsonType.float) self.value.float else null;
+        return if (self.value == .float) self.value.float else null;
     }
 
     /// Returns the array value or null
     pub fn arrayOrNull(self: *JsonValue) ?*JsonArray {
-        return if (self.type == JsonType.array) self.value.array else null;
+        return if (self.value == .array) self.value.array else null;
     }
 
     /// Returns the boolean value or null
     pub fn booleanOrNull(self: *JsonValue) ?bool {
-        return if (self.type == JsonType.boolean) self.value.boolean else null;
+        return if (self.value == .boolean) self.value.boolean else null;
     }
 
     /// Print the JSON value
     pub fn print(self: *JsonValue, indent: ?usize) void {
-        switch (self.type) {
-            JsonType.integer => std.debug.print("{d}", .{self.integer()}),
-            JsonType.float => std.debug.print("{d}", .{self.float()}),
-            JsonType.string => std.debug.print("\"{s}\"", .{self.string()}),
-            JsonType.boolean => std.debug.print("\"{any}\"", .{self.boolean()}),
-            JsonType.nil => std.debug.print("null", .{}),
-            JsonType.object => self.value.?.object.print(indent),
-            JsonType.array => self.value.?.array.print(indent),
+        switch (self.value) {
+            .integer => |i| std.debug.print("{d}", .{i}),
+            .float => |f| std.debug.print("{d}", .{f}),
+            .string => |s| std.debug.print("\"{s}\"", .{s}),
+            .boolean => |b| std.debug.print("{any}", .{b}),
+            .nil => std.debug.print("null", .{}),
+            .object => |o| o.print(indent),
+            .array => |a| a.print(indent),
+        }
+    }
+
+    /// Serialize the JSON value to a writer
+    pub fn serialize(self: *JsonValue, writer: anytype, indent: JsonIndent, depth: usize) anyerror!void {
+        switch (self.value) {
+            .integer => |i| {
+                if (depth > 0) try serializerWriteIndent(writer, indent, depth);
+                try writer.print("{d}", .{i});
+            },
+            .float => |f| try writer.print("{d}", .{f}),
+            .string => |s| try writer.print("\"{s}\"", .{s}),
+            .boolean => |b| try writer.print("{any}", .{b}),
+            .nil => try writer.print("null", .{}),
+            .object => |o| try o.serialize(writer, indent, depth),
+            .array => |a| try a.serialize(writer, indent, depth),
         }
     }
 };
@@ -439,25 +444,25 @@ pub const CONFIG_RFC8259 = ParserConfig{ .parserType = ParserType.rfc8259 };
 pub const CONFIG_JSON5 = ParserConfig{ .parserType = ParserType.json5 };
 
 /// "Constant" for JSON true value
-var JSON_TRUE = JsonValue{ .type = JsonType.boolean, .value = .{ .boolean = true }, .indestructible = true, .stringPtr = null };
+var JSON_TRUE = JsonValue{ .value = .{ .boolean = true }, .indestructible = true };
 
 /// "Constant" for JSON false value
-var JSON_FALSE = JsonValue{ .type = JsonType.boolean, .value = .{ .boolean = false }, .indestructible = true, .stringPtr = null };
+var JSON_FALSE = JsonValue{ .value = .{ .boolean = false }, .indestructible = true };
 
 /// "Constant" for JSON null value
-var JSON_NULL = JsonValue{ .type = JsonType.nil, .value = null, .indestructible = true, .stringPtr = null };
+var JSON_NULL = JsonValue{ .value = .{ .nil = @as(void, undefined) }, .indestructible = true };
 
 /// "Constant" for JSON positive infinity
-var JSON_POSITIVE_INFINITY = JsonValue{ .type = JsonType.float, .value = .{ .float = std.math.inf(f64) }, .indestructible = true, .stringPtr = null };
+var JSON_POSITIVE_INFINITY = JsonValue{ .value = .{ .float = std.math.inf(f64) }, .indestructible = true };
 
 /// "Constant" for JSON negative infinity
-var JSON_NEGATIVE_INFINITY = JsonValue{ .type = JsonType.float, .value = .{ .float = -std.math.inf(f64) }, .indestructible = true, .stringPtr = null };
+var JSON_NEGATIVE_INFINITY = JsonValue{ .value = .{ .float = -std.math.inf(f64) }, .indestructible = true };
 
 /// "Constant" for JSON positive NaN
-var JSON_POSITIVE_NAN = JsonValue{ .type = JsonType.float, .value = .{ .float = std.math.nan(f64) }, .indestructible = true, .stringPtr = null };
+var JSON_POSITIVE_NAN = JsonValue{ .value = .{ .float = std.math.nan(f64) }, .indestructible = true };
 
 /// "Constant" for JSON negative NaN
-var JSON_NEGATIVE_NAN = JsonValue{ .type = JsonType.float, .value = .{ .float = -std.math.nan(f64) }, .indestructible = true, .stringPtr = null };
+var JSON_NEGATIVE_NAN = JsonValue{ .value = .{ .float = -std.math.nan(f64) }, .indestructible = true };
 
 /// Parse a JSON5 string using the provided allocator
 pub fn parse(allocator: Allocator, jsonString: []const u8) !*JsonValue {
@@ -634,7 +639,6 @@ fn parseObject(allocator: Allocator, buffer: *Buffer, config: ParserConfig) Pars
     const jsonValue = try allocator.create(JsonValue);
     errdefer jsonValue.deinit(allocator);
 
-    jsonValue.type = JsonType.object;
     jsonValue.value = .{ .object = jsonObject };
 
     return jsonValue;
@@ -680,7 +684,6 @@ fn parseArray(allocator: Allocator, buffer: *Buffer, config: ParserConfig) Parse
     const jsonValue = try allocator.create(JsonValue);
     errdefer jsonValue.deinit(allocator);
 
-    jsonValue.type = JsonType.array;
     jsonValue.value = .{ .array = jsonArray };
 
     return jsonValue;
@@ -719,9 +722,7 @@ fn parseStringWithTerminal(allocator: Allocator, buffer: *Buffer, config: Parser
     }
     characters.deinit();
 
-    jsonValue.type = JsonType.string;
     jsonValue.value = .{ .string = copy };
-    jsonValue.stringPtr = copy;
 
     try buffer.skipBytes(1);
     return jsonValue;
@@ -823,13 +824,6 @@ fn parseNumber(allocator: Allocator, buffer: *Buffer, config: ParserConfig) Pars
     const jsonValue = try allocator.create(JsonValue);
     errdefer jsonValue.deinit(allocator);
 
-    jsonValue.type = switch (encodingType) {
-        NumberEncoding.integer => JsonType.integer,
-        NumberEncoding.float => JsonType.float,
-        NumberEncoding.hex => JsonType.integer,
-        else => return error.ParseNumberError,
-    };
-
     var numberString = try allocator.alloc(u8, numberList.items.len);
     defer allocator.free(numberString);
 
@@ -894,9 +888,7 @@ fn parseEcmaScript51Identifier(allocator: Allocator, buffer: *Buffer) ParseError
     }
     characters.deinit();
 
-    jsonValue.type = JsonType.string;
     jsonValue.value = .{ .string = copy };
-    jsonValue.stringPtr = copy;
 
     return jsonValue;
 }
@@ -1093,8 +1085,8 @@ fn expectParseNumberToParseNumber(number: anytype, text: []const u8, config: Par
     };
 
     switch (@typeInfo(@TypeOf(number))) {
-        .Int, @typeInfo(comptime_int) => try std.testing.expectEqual(JsonType.integer, value.type),
-        .Float, @typeInfo(comptime_float) => try std.testing.expectEqual(JsonType.float, value.type),
+        .Int, @typeInfo(comptime_int) => try std.testing.expect(value.value == .integer),
+        .Float, @typeInfo(comptime_float) => try std.testing.expect(value.value == .float),
         @typeInfo(ParseErrors) => {},
         else => @compileError("Eek: " ++ @typeName(@TypeOf(number))),
     }
@@ -1128,14 +1120,14 @@ test "parse can parse a number" {
 
     var bufferOne = bufferFromText("0");
     var value = try parseBuffer(allocator, &bufferOne);
-    try std.testing.expectEqual(value.type, JsonType.integer);
+    try std.testing.expect(value.value == .integer);
     try std.testing.expectEqual(value.integer(), 0);
 
     value.deinit(allocator);
 
     var bufferTwo = bufferFromText("0.1");
     value = try parseBuffer(allocator, &bufferTwo);
-    try std.testing.expectEqual(value.type, JsonType.float);
+    try std.testing.expect(value.value == .float);
     try std.testing.expectEqual(value.float(), 0.1);
 
     value.deinit(allocator);
@@ -1150,7 +1142,7 @@ test "parse can parse a object" {
 
     var buffer = bufferFromText("{\"foo\":\"bar\"}");
     const value = try parseBuffer(allocator, &buffer);
-    try std.testing.expectEqual(value.type, JsonType.object);
+    try std.testing.expect(value.value == .object);
 
     value.deinit(allocator);
 
@@ -1164,7 +1156,7 @@ test "parse can parse a array" {
 
     var buffer = bufferFromText("[0,\"foo\",1.337]");
     const value = try parseBuffer(allocator, &buffer);
-    try std.testing.expectEqual(value.type, JsonType.array);
+    try std.testing.expect(value.value == .array);
     try std.testing.expectEqual(value.get(0).integer(), 0);
     try std.testing.expect(std.mem.eql(u8, value.get(1).string(), "foo"));
     try std.testing.expectEqual(value.get(2).float(), 1.337);
@@ -1181,7 +1173,7 @@ test "parse can parse an object" {
 
     var buffer = bufferFromText("{\"foo\":\"bar\", \"zig\":\"zabim\"}");
     const value = try parseBuffer(allocator, &buffer);
-    try std.testing.expectEqual(value.type, JsonType.object);
+    try std.testing.expect(value.value == .object);
     try std.testing.expect(std.mem.eql(u8, value.get("foo").string(), "bar"));
     const keys = value.object().keys();
 
@@ -1202,7 +1194,7 @@ test "RFC8259.3: parseValue can parse true" {
 
     var buffer = bufferFromText("true");
     const value = try parseValue(allocator, &buffer, CONFIG_RFC8259);
-    try std.testing.expectEqual(value.type, JsonType.boolean);
+    try std.testing.expect(value.value == .boolean);
     try std.testing.expectEqual(value.boolean(), true);
 
     // Note: true, false, and null are constant JsonValues
@@ -1218,7 +1210,7 @@ test "RFC8259.3: parseValue can parse false" {
 
     var buffer = bufferFromText("false");
     const value = try parseValue(allocator, &buffer, CONFIG_RFC8259);
-    try std.testing.expectEqual(value.type, JsonType.boolean);
+    try std.testing.expect(value.value == .boolean);
     try std.testing.expectEqual(value.boolean(), false);
 
     // Note: true, false, and null are constant JsonValues
@@ -1234,8 +1226,8 @@ test "RFC8259.3: parseValue can parse null" {
 
     var buffer = bufferFromText("null");
     const value = try parseValue(allocator, &buffer, CONFIG_RFC8259);
-    try std.testing.expectEqual(value.type, JsonType.nil);
-    try std.testing.expect(value.value == null);
+    try std.testing.expect(value.value == .nil);
+    try std.testing.expect(value.value == .nil);
 
     // Note: true, false, and null are constant JsonValues
     // and should not be destroyed
@@ -1251,7 +1243,7 @@ test "RFC8259.4: parseObject can parse an empty object /1" {
     var buffer = bufferFromText("{}");
     const value = try parseValue(allocator, &buffer, CONFIG_RFC8259);
     errdefer value.deinit(allocator);
-    try std.testing.expectEqual(value.type, JsonType.object);
+    try std.testing.expect(value.value == .object);
     try std.testing.expectEqual(value.object().len(), 0);
 
     value.deinit(allocator);
@@ -1267,7 +1259,7 @@ test "RFC8259.4: parseObject can parse an empty object /2" {
     var buffer = bufferFromText("{ }");
     const value = try parseValue(allocator, &buffer, CONFIG_RFC8259);
     errdefer value.deinit(allocator);
-    try std.testing.expectEqual(value.type, JsonType.object);
+    try std.testing.expect(value.value == .object);
     try std.testing.expectEqual(value.object().len(), 0);
 
     value.deinit(allocator);
@@ -1284,7 +1276,7 @@ test "RFC8259.4: parseObject can parse an empty object /3" {
     var buffer = bufferFromText("\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}{\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}}\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}");
     const value = try parseValue(allocator, &buffer, CONFIG_RFC8259);
     errdefer value.deinit(allocator);
-    try std.testing.expectEqual(value.type, JsonType.object);
+    try std.testing.expect(value.value == .object);
     try std.testing.expectEqual(value.object().len(), 0);
 
     value.deinit(allocator);
@@ -1299,26 +1291,26 @@ test "RFC8259.4: parseObject can parse a simple object /1" {
 
     var buffer = bufferFromText("{\"key1\": \"foo\", \"key2\": \"foo2\", \"key3\": -1, \"key4\": [], \"key5\": { } }");
     var jsonResult = try parseObject(allocator, &buffer, CONFIG_RFC8259);
-    try std.testing.expectEqual(jsonResult.type, JsonType.object);
+    try std.testing.expect(jsonResult.value == .object);
 
     try std.testing.expectEqual(jsonResult.object().contains("key1"), true);
-    try std.testing.expectEqual(jsonResult.get("key1").type, JsonType.string);
+    try std.testing.expect(jsonResult.get("key1").value == .string);
     try std.testing.expect(std.mem.eql(u8, jsonResult.get("key1").string(), "foo"));
 
     try std.testing.expectEqual(jsonResult.object().contains("key2"), true);
-    try std.testing.expectEqual(jsonResult.get("key2").type, JsonType.string);
+    try std.testing.expect(jsonResult.get("key2").value == .string);
     try std.testing.expect(std.mem.eql(u8, jsonResult.get("key2").string(), "foo2"));
 
     try std.testing.expectEqual(jsonResult.object().contains("key3"), true);
-    try std.testing.expectEqual(jsonResult.get("key3").type, JsonType.integer);
+    try std.testing.expect(jsonResult.get("key3").value == .integer);
     try std.testing.expectEqual(jsonResult.get("key3").integer(), -1);
 
     try std.testing.expectEqual(jsonResult.object().contains("key4"), true);
-    try std.testing.expectEqual(jsonResult.get("key4").type, JsonType.array);
+    try std.testing.expect(jsonResult.get("key4").value == .array);
     try std.testing.expectEqual(jsonResult.get("key4").len(), 0);
 
     try std.testing.expectEqual(jsonResult.object().contains("key5"), true);
-    try std.testing.expectEqual(jsonResult.get("key5").type, JsonType.object);
+    try std.testing.expect(jsonResult.get("key5").value == .object);
     try std.testing.expectEqual(jsonResult.get("key5").len(), 0);
 
     jsonResult.deinit(allocator);
@@ -1335,26 +1327,26 @@ test "RFC8259.4: parseObject can parse a simple object /2" {
     // characters
     var buffer = bufferFromText("\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}{\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"key1\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}:\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"foo\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"key2\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}:\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"foo2\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"key3\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}:\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}-1\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"key4\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}:\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}[]\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"key5\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}:\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}{\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}}\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}}\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}");
     var jsonResult = try parseObject(allocator, &buffer, CONFIG_RFC8259);
-    try std.testing.expectEqual(jsonResult.type, JsonType.object);
+    try std.testing.expect(jsonResult.value == .object);
 
     try std.testing.expectEqual(jsonResult.object().contains("key1"), true);
-    try std.testing.expectEqual(jsonResult.get("key1").type, JsonType.string);
+    try std.testing.expect(jsonResult.get("key1").value == .string);
     try std.testing.expect(std.mem.eql(u8, jsonResult.get("key1").string(), "foo"));
 
     try std.testing.expectEqual(jsonResult.object().contains("key2"), true);
-    try std.testing.expectEqual(jsonResult.get("key2").type, JsonType.string);
+    try std.testing.expect(jsonResult.get("key2").value == .string);
     try std.testing.expect(std.mem.eql(u8, jsonResult.get("key2").string(), "foo2"));
 
     try std.testing.expectEqual(jsonResult.object().contains("key3"), true);
-    try std.testing.expectEqual(jsonResult.get("key3").type, JsonType.integer);
+    try std.testing.expect(jsonResult.get("key3").value == .integer);
     try std.testing.expectEqual(jsonResult.get("key3").integer(), -1);
 
     try std.testing.expectEqual(jsonResult.object().contains("key4"), true);
-    try std.testing.expectEqual(jsonResult.get("key4").type, JsonType.array);
+    try std.testing.expect(jsonResult.get("key4").value == .array);
     try std.testing.expectEqual(jsonResult.get("key4").len(), 0);
 
     try std.testing.expectEqual(jsonResult.object().contains("key5"), true);
-    try std.testing.expectEqual(jsonResult.get("key5").type, JsonType.object);
+    try std.testing.expect(jsonResult.get("key5").value == .object);
     try std.testing.expectEqual(jsonResult.get("key5").len(), 0);
 
     jsonResult.deinit(allocator);
@@ -1398,7 +1390,7 @@ test "RFC8259.5: parseArray can parse an empty array /1" {
     var buffer = bufferFromText("[]");
     const value = try parseArray(allocator, &buffer, CONFIG_RFC8259);
     errdefer value.deinit(allocator);
-    try std.testing.expectEqual(value.type, JsonType.array);
+    try std.testing.expect(value.value == .array);
     try std.testing.expectEqual(value.array().len(), 0);
 
     value.deinit(allocator);
@@ -1414,7 +1406,7 @@ test "RFC8259.5: parseArray can parse an empty array /2" {
     var buffer = bufferFromText("\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}[\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}]\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}");
     const value = try parseArray(allocator, &buffer, CONFIG_RFC8259);
     errdefer value.deinit(allocator);
-    try std.testing.expectEqual(value.type, JsonType.array);
+    try std.testing.expect(value.value == .array);
     try std.testing.expectEqual(value.array().len(), 0);
 
     value.deinit(allocator);
@@ -1430,7 +1422,7 @@ test "RFC8259.5: parseArray can parse an simple array /3" {
     var buffer = bufferFromText("[-1,-1.2,0,1,1.2,\"\",\"foo\",true,false,null,{},{\"foo\":\"bar\", \"baz\": {}}]");
     const value = try parseArray(allocator, &buffer, CONFIG_RFC8259);
     errdefer value.deinit(allocator);
-    try std.testing.expectEqual(value.type, JsonType.array);
+    try std.testing.expect(value.value == .array);
     try std.testing.expectEqual(value.array().len(), 12);
 
     value.deinit(allocator);
@@ -1446,7 +1438,7 @@ test "RFC8259.5: parseArray can parse an simple array /4" {
     var buffer = bufferFromText("\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}[\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}-1\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}-1.2\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}0\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}1\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}1.2\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"foo\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}true\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}false\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}null\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}{\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}}\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}{\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"foo\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}:\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"bar\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"baz\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}:\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}{\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}}\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}}\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}]\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}");
     const value = try parseArray(allocator, &buffer, CONFIG_RFC8259);
     errdefer value.deinit(allocator);
-    try std.testing.expectEqual(value.type, JsonType.array);
+    try std.testing.expect(value.value == .array);
     try std.testing.expectEqual(value.array().len(), 12);
 
     value.deinit(allocator);
@@ -1473,7 +1465,7 @@ test "RFC8259.6: parseNumber can parse a integer /1" {
 
     var buffer = bufferFromText("0");
     const value = try parseNumber(allocator, &buffer, CONFIG_RFC8259);
-    try std.testing.expectEqual(value.type, JsonType.integer);
+    try std.testing.expect(value.value == .integer);
     try std.testing.expectEqual(value.integer(), 0);
 
     value.deinit(allocator);
@@ -1488,7 +1480,7 @@ test "RFC8259.6: parseNumber can parse a integer /2" {
 
     var buffer = bufferFromText("1");
     const value = try parseNumber(allocator, &buffer, CONFIG_RFC8259);
-    try std.testing.expectEqual(value.type, JsonType.integer);
+    try std.testing.expect(value.value == .integer);
     try std.testing.expectEqual(value.integer(), 1);
 
     value.deinit(allocator);
@@ -1503,7 +1495,7 @@ test "RFC8259.6: parseNumber can parse a integer /3" {
 
     var buffer = bufferFromText("1337");
     const value = try parseNumber(allocator, &buffer, CONFIG_RFC8259);
-    try std.testing.expectEqual(value.type, JsonType.integer);
+    try std.testing.expect(value.value == .integer);
     try std.testing.expectEqual(value.integer(), 1337);
 
     value.deinit(allocator);
@@ -1518,7 +1510,7 @@ test "RFC8259.6: parseNumber can parse a integer /4" {
 
     var buffer = bufferFromText("-1337");
     const value = try parseNumber(allocator, &buffer, CONFIG_RFC8259);
-    try std.testing.expectEqual(value.type, JsonType.integer);
+    try std.testing.expect(value.value == .integer);
     try std.testing.expectEqual(value.integer(), -1337);
 
     value.deinit(allocator);
@@ -1533,7 +1525,7 @@ test "RFC8259.6: parseNumber can parse a float /1" {
 
     var buffer = bufferFromText("1.0");
     const value = try parseNumber(allocator, &buffer, CONFIG_RFC8259);
-    try std.testing.expectEqual(value.type, JsonType.float);
+    try std.testing.expect(value.value == .float);
     try std.testing.expectEqual(value.float(), 1.0);
 
     value.deinit(allocator);
@@ -1548,7 +1540,7 @@ test "RFC8259.6: parseNumber can parse a float /2" {
 
     var buffer = bufferFromText("-1.0");
     const value = try parseNumber(allocator, &buffer, CONFIG_RFC8259);
-    try std.testing.expectEqual(value.type, JsonType.float);
+    try std.testing.expect(value.value == .float);
     try std.testing.expectEqual(value.float(), -1.0);
 
     value.deinit(allocator);
@@ -1563,7 +1555,7 @@ test "RFC8259.6: parseNumber can parse a float /3" {
 
     var buffer = bufferFromText("1337.0123456789");
     const value = try parseNumber(allocator, &buffer, CONFIG_RFC8259);
-    try std.testing.expectEqual(value.type, JsonType.float);
+    try std.testing.expect(value.value == .float);
     try std.testing.expectEqual(value.float(), 1337.0123456789);
 
     value.deinit(allocator);
@@ -1578,7 +1570,7 @@ test "RFC8259.6: parseNumber can parse a float /4" {
 
     var buffer = bufferFromText("-1337.0123456789");
     const value = try parseNumber(allocator, &buffer, CONFIG_RFC8259);
-    try std.testing.expectEqual(value.type, JsonType.float);
+    try std.testing.expect(value.value == .float);
     try std.testing.expectEqual(value.float(), -1337.0123456789);
 
     value.deinit(allocator);
@@ -1593,7 +1585,7 @@ test "RFC8259.6: parseNumber can parse an exponent /1" {
 
     var buffer = bufferFromText("13e37");
     const value = try parseNumber(allocator, &buffer, CONFIG_RFC8259);
-    try std.testing.expectEqual(value.type, JsonType.float);
+    try std.testing.expect(value.value == .float);
     try std.testing.expectEqual(value.float(), 13e37);
 
     value.deinit(allocator);
@@ -1608,7 +1600,7 @@ test "RFC8259.6: parseNumber can parse an exponent /2" {
 
     var buffer = bufferFromText("13E37");
     const value = try parseNumber(allocator, &buffer, CONFIG_RFC8259);
-    try std.testing.expectEqual(value.type, JsonType.float);
+    try std.testing.expect(value.value == .float);
     try std.testing.expectEqual(value.float(), 13E37);
 
     value.deinit(allocator);
@@ -1623,7 +1615,7 @@ test "RFC8259.6: parseNumber can parse an exponent /3" {
 
     var buffer = bufferFromText("13E+37");
     const value = try parseNumber(allocator, &buffer, CONFIG_RFC8259);
-    try std.testing.expectEqual(value.type, JsonType.float);
+    try std.testing.expect(value.value == .float);
     try std.testing.expectEqual(value.float(), 13E+37);
 
     value.deinit(allocator);
@@ -1638,7 +1630,7 @@ test "RFC8259.6: parseNumber can parse an exponent /4" {
 
     var buffer = bufferFromText("13E-37");
     const value = try parseNumber(allocator, &buffer, CONFIG_RFC8259);
-    try std.testing.expectEqual(value.type, JsonType.float);
+    try std.testing.expect(value.value == .float);
     try std.testing.expectEqual(value.float(), 13E-37);
 
     value.deinit(allocator);
@@ -1653,7 +1645,7 @@ test "RFC8259.6: parseNumber can parse an exponent /5" {
 
     var buffer = bufferFromText("-13e37");
     const value = try parseNumber(allocator, &buffer, CONFIG_RFC8259);
-    try std.testing.expectEqual(value.type, JsonType.float);
+    try std.testing.expect(value.value == .float);
     try std.testing.expectEqual(value.float(), -13e37);
 
     value.deinit(allocator);
@@ -1668,7 +1660,7 @@ test "RFC8259.6: parseNumber can parse an exponent /6" {
 
     var buffer = bufferFromText("-13E37");
     const value = try parseNumber(allocator, &buffer, CONFIG_RFC8259);
-    try std.testing.expectEqual(value.type, JsonType.float);
+    try std.testing.expect(value.value == .float);
     try std.testing.expectEqual(value.float(), -13E37);
 
     value.deinit(allocator);
@@ -1683,7 +1675,7 @@ test "RFC8259.6: parseNumber can parse an exponent /7" {
 
     var buffer = bufferFromText("-13E+37");
     const value = try parseNumber(allocator, &buffer, CONFIG_RFC8259);
-    try std.testing.expectEqual(value.type, JsonType.float);
+    try std.testing.expect(value.value == .float);
     try std.testing.expectEqual(value.float(), -13E+37);
 
     value.deinit(allocator);
@@ -1698,7 +1690,7 @@ test "RFC8259.6: parseNumber can parse an exponent /8" {
 
     var buffer = bufferFromText("13E-37");
     const value = try parseNumber(allocator, &buffer, CONFIG_RFC8259);
-    try std.testing.expectEqual(value.type, JsonType.float);
+    try std.testing.expect(value.value == .float);
     try std.testing.expectEqual(value.float(), 13E-37);
 
     value.deinit(allocator);
@@ -1801,7 +1793,7 @@ test "JSON5.7 parseArray ignores multi-line comments /1" {
 
     var buffer = bufferFromText("/* comment */[/* comment */1/* comment */,/* comment */\"two\"/* comment */,/* comment */3.0/* comment */,/* comment */{/* comment */},/* comment */'five'/* comment */,/* comment */{/* comment */six/* comment */:/* comment */0x07/* comment */}/* comment */]/* comment */");
     const value = try parseArray(allocator, &buffer, CONFIG_JSON5);
-    try std.testing.expectEqual(value.type, JsonType.array);
+    try std.testing.expect(value.value == .array);
     try std.testing.expectEqual(value.get(0).integer(), 1);
     try std.testing.expect(std.mem.eql(u8, value.get(1).string(), "two"));
     try std.testing.expectEqual(value.get(2).float(), 3.0);
@@ -1821,7 +1813,7 @@ test "JSON5.7 parseArray ignores single-line comments /2" {
 
     var buffer = bufferFromText("// comment \n[// comment \n1// comment \n,// comment \n\"two\"// comment \n,// comment \n3.0// comment \n,// comment \n{// comment \n},// comment \n'five'// comment \n,// comment \n{// comment \nsix// comment \n:// comment \n0x07// comment \n}// comment \n]// comment \n");
     const value = try parseArray(allocator, &buffer, CONFIG_JSON5);
-    try std.testing.expectEqual(value.type, JsonType.array);
+    try std.testing.expect(value.value == .array);
     try std.testing.expectEqual(value.get(0).integer(), 1);
     try std.testing.expect(std.mem.eql(u8, value.get(1).string(), "two"));
     try std.testing.expectEqual(value.get(2).float(), 3.0);
@@ -1841,26 +1833,26 @@ test "JSON5.7: parseObject ignores multi-line comments /1" {
 
     var buffer = bufferFromText("/* comment */{/* comment */key1/* comment */:/* comment */\"foo\"/* comment */,/* comment */ȡkey2/* comment */:/* comment */\"foo2\"/* comment */,/* comment */\u{0221}key3/* comment */:/* comment */-1/* comment */,/* comment */'key4'/* comment */:/* comment */[/* comment */]/* comment */,/* comment */\"key5\"/* comment */:/* comment */{/* comment */}/* comment */,/* comment */}/* comment */");
     var jsonResult = try parseObject(allocator, &buffer, CONFIG_JSON5);
-    try std.testing.expectEqual(jsonResult.type, JsonType.object);
+    try std.testing.expect(jsonResult.value == .object);
 
     try std.testing.expectEqual(jsonResult.object().contains("key1"), true);
-    try std.testing.expectEqual(jsonResult.get("key1").type, JsonType.string);
+    try std.testing.expect(jsonResult.get("key1").value == .string);
     try std.testing.expect(std.mem.eql(u8, jsonResult.get("key1").string(), "foo"));
 
     try std.testing.expectEqual(jsonResult.object().contains("\u{0221}key2"), true);
-    try std.testing.expectEqual(jsonResult.get("\u{0221}key2").type, JsonType.string);
+    try std.testing.expect(jsonResult.get("\u{0221}key2").value == .string);
     try std.testing.expect(std.mem.eql(u8, jsonResult.get("\u{0221}key2").string(), "foo2"));
 
     try std.testing.expectEqual(jsonResult.object().contains("ȡkey3"), true);
-    try std.testing.expectEqual(jsonResult.get("ȡkey3").type, JsonType.integer);
+    try std.testing.expect(jsonResult.get("ȡkey3").value == .integer);
     try std.testing.expectEqual(jsonResult.get("ȡkey3").integer(), -1);
 
     try std.testing.expectEqual(jsonResult.object().contains("key4"), true);
-    try std.testing.expectEqual(jsonResult.get("key4").type, JsonType.array);
+    try std.testing.expect(jsonResult.get("key4").value == .array);
     try std.testing.expectEqual(jsonResult.get("key4").len(), 0);
 
     try std.testing.expectEqual(jsonResult.object().contains("key5"), true);
-    try std.testing.expectEqual(jsonResult.get("key5").type, JsonType.object);
+    try std.testing.expect(jsonResult.get("key5").value == .object);
     try std.testing.expectEqual(jsonResult.get("key5").len(), 0);
 
     jsonResult.deinit(allocator);
@@ -1875,26 +1867,26 @@ test "JSON5.7: parseObject ignores single-line comments /2" {
 
     var buffer = bufferFromText("// comment \n{// comment \nkey1// comment \n:// comment \n\"foo\"// comment \n,// comment \nȡkey2// comment \n:// comment \n\"foo2\"// comment \n,// comment \n\u{0221}key3// comment \n:// comment \n-1// comment \n,// comment \n'key4'// comment \n:// comment \n[// comment \n]// comment \n,// comment \n\"key5\"// comment \n:// comment \n{// comment \n}// comment \n,// comment \n}// comment \n");
     var jsonResult = try parseObject(allocator, &buffer, CONFIG_JSON5);
-    try std.testing.expectEqual(jsonResult.type, JsonType.object);
+    try std.testing.expect(jsonResult.value == .object);
 
     try std.testing.expectEqual(jsonResult.object().contains("key1"), true);
-    try std.testing.expectEqual(jsonResult.get("key1").type, JsonType.string);
+    try std.testing.expect(jsonResult.get("key1").value == .string);
     try std.testing.expect(std.mem.eql(u8, jsonResult.get("key1").string(), "foo"));
 
     try std.testing.expectEqual(jsonResult.object().contains("\u{0221}key2"), true);
-    try std.testing.expectEqual(jsonResult.get("\u{0221}key2").type, JsonType.string);
+    try std.testing.expect(jsonResult.get("\u{0221}key2").value == .string);
     try std.testing.expect(std.mem.eql(u8, jsonResult.get("\u{0221}key2").string(), "foo2"));
 
     try std.testing.expectEqual(jsonResult.object().contains("ȡkey3"), true);
-    try std.testing.expectEqual(jsonResult.get("ȡkey3").type, JsonType.integer);
+    try std.testing.expect(jsonResult.get("ȡkey3").value == .integer);
     try std.testing.expectEqual(jsonResult.get("ȡkey3").integer(), -1);
 
     try std.testing.expectEqual(jsonResult.object().contains("key4"), true);
-    try std.testing.expectEqual(jsonResult.get("key4").type, JsonType.array);
+    try std.testing.expect(jsonResult.get("key4").value == .array);
     try std.testing.expectEqual(jsonResult.get("key4").len(), 0);
 
     try std.testing.expectEqual(jsonResult.object().contains("key5"), true);
-    try std.testing.expectEqual(jsonResult.get("key5").type, JsonType.object);
+    try std.testing.expect(jsonResult.get("key5").value == .object);
     try std.testing.expectEqual(jsonResult.get("key5").len(), 0);
 
     jsonResult.deinit(allocator);
@@ -1909,7 +1901,7 @@ test "RFC8259.7: parseStringWithTerminal can parse an empty string /1" {
 
     var buffer = bufferFromText("\"\"");
     const value = try parseStringWithTerminal(allocator, &buffer, CONFIG_RFC8259, TOKEN_DOUBLE_QUOTE);
-    try std.testing.expectEqual(value.type, JsonType.string);
+    try std.testing.expect(value.value == .string);
     try std.testing.expect(std.mem.eql(u8, value.string(), ""));
 
     value.deinit(allocator);
@@ -1924,7 +1916,7 @@ test "RFC8259.7: parseStringWithTerminal can parse an empty string /2" {
 
     var buffer = bufferFromText("\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}");
     const value = try parseStringWithTerminal(allocator, &buffer, CONFIG_RFC8259, TOKEN_DOUBLE_QUOTE);
-    try std.testing.expectEqual(value.type, JsonType.string);
+    try std.testing.expect(value.value == .string);
     try std.testing.expect(std.mem.eql(u8, value.string(), ""));
 
     value.deinit(allocator);
@@ -1939,7 +1931,7 @@ test "RFC8259.7: parseStringWithTerminal can parse a simple string /1" {
 
     var buffer = bufferFromText("\"some string\"");
     const value = try parseStringWithTerminal(allocator, &buffer, CONFIG_RFC8259, TOKEN_DOUBLE_QUOTE);
-    try std.testing.expectEqual(value.type, JsonType.string);
+    try std.testing.expect(value.value == .string);
     try std.testing.expect(std.mem.eql(u8, value.string(), "some string"));
 
     value.deinit(allocator);
@@ -1954,7 +1946,7 @@ test "RFC8259.7: parseStringWithTerminal can parse a simple string /2" {
 
     var buffer = bufferFromText("\"some\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}string\"");
     const value = try parseStringWithTerminal(allocator, &buffer, CONFIG_RFC8259, TOKEN_DOUBLE_QUOTE);
-    try std.testing.expectEqual(value.type, JsonType.string);
+    try std.testing.expect(value.value == .string);
     try std.testing.expect(std.mem.eql(u8, value.string(), "some\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}string"));
 
     value.deinit(allocator);
@@ -1970,7 +1962,7 @@ test "RFC8259.7: parseStringWithTerminal can parse a simple string /3" {
     // some\"string
     var buffer = bufferFromText("\"some\\\"string\"");
     const value = try parseStringWithTerminal(allocator, &buffer, CONFIG_RFC8259, TOKEN_DOUBLE_QUOTE);
-    try std.testing.expectEqual(value.type, JsonType.string);
+    try std.testing.expect(value.value == .string);
     try std.testing.expect(std.mem.eql(u8, value.string(), "some\"string"));
 
     value.deinit(allocator);
@@ -1986,7 +1978,7 @@ test "RFC8259.7: parseStringWithTerminal can parse a simple string /4" {
     // some\\"string
     var buffer = bufferFromText("\"some\\\\\\\"string\"");
     const value = try parseStringWithTerminal(allocator, &buffer, CONFIG_RFC8259, TOKEN_DOUBLE_QUOTE);
-    try std.testing.expectEqual(value.type, JsonType.string);
+    try std.testing.expect(value.value == .string);
     try std.testing.expect(std.mem.eql(u8, value.string(), "some\\\"string"));
 
     value.deinit(allocator);
@@ -2002,7 +1994,7 @@ test "RFC8259.7: parseStringWithTerminal can parse a simple string /5" {
     // ",\,\u{00-0f}
     var buffer = bufferFromText("\"\\\"\\\\\u{00}\u{01}\u{02}\u{03}\u{04}\u{05}\u{06}\u{07}\u{08}\u{09}\u{0A}\u{0B}\u{0C}\u{0D}\u{0E}\u{0F}\u{10}\u{11}\u{12}\u{13}\u{14}\u{15}\u{16}\u{17}\u{18}\u{19}\u{1A}\u{1B}\u{1C}\u{1D}\u{1E}\u{1F}\"");
     const value = try parseStringWithTerminal(allocator, &buffer, CONFIG_RFC8259, TOKEN_DOUBLE_QUOTE);
-    try std.testing.expectEqual(value.type, JsonType.string);
+    try std.testing.expect(value.value == .string);
     try std.testing.expect(std.mem.eql(u8, value.string(), "\"\\\u{00}\u{01}\u{02}\u{03}\u{04}\u{05}\u{06}\u{07}\u{08}\u{09}\u{0A}\u{0B}\u{0C}\u{0D}\u{0E}\u{0F}\u{10}\u{11}\u{12}\u{13}\u{14}\u{15}\u{16}\u{17}\u{18}\u{19}\u{1A}\u{1B}\u{1C}\u{1D}\u{1E}\u{1F}"));
 
     value.deinit(allocator);
@@ -2018,7 +2010,7 @@ test "RFC8259.8.3: parseStringWithTerminal parsing results in equivalent strings
     // Test that \\ equals \u{5C}
     var buffer = bufferFromText("\"a\\\\b\"");
     const value = try parseStringWithTerminal(allocator, &buffer, CONFIG_RFC8259, TOKEN_DOUBLE_QUOTE);
-    try std.testing.expectEqual(value.type, JsonType.string);
+    try std.testing.expect(value.value == .string);
     try std.testing.expect(std.mem.eql(u8, value.string(), "a\u{5C}b"));
 
     value.deinit(allocator);
@@ -2033,7 +2025,7 @@ test "JSON5; parseEcmaScript51Identifier can parse simple identifier /1" {
 
     var buffer = bufferFromText("someIdentifier");
     const value = try parseEcmaScript51Identifier(allocator, &buffer);
-    try std.testing.expectEqual(value.type, JsonType.string);
+    try std.testing.expect(value.value == .string);
     try std.testing.expect(std.mem.eql(u8, value.string(), "someIdentifier"));
 
     value.deinit(allocator);
@@ -2048,7 +2040,7 @@ test "JSON5; parseEcmaScript51Identifier can parse simple identifier /2" {
 
     var buffer = bufferFromText("_someIdentifier");
     const value = try parseEcmaScript51Identifier(allocator, &buffer);
-    try std.testing.expectEqual(value.type, JsonType.string);
+    try std.testing.expect(value.value == .string);
     try std.testing.expect(std.mem.eql(u8, value.string(), "_someIdentifier"));
 
     value.deinit(allocator);
@@ -2063,7 +2055,7 @@ test "JSON5; parseEcmaScript51Identifier can parse simple identifier /3" {
 
     var buffer = bufferFromText("$someIdentifier");
     const value = try parseEcmaScript51Identifier(allocator, &buffer);
-    try std.testing.expectEqual(value.type, JsonType.string);
+    try std.testing.expect(value.value == .string);
     try std.testing.expect(std.mem.eql(u8, value.string(), "$someIdentifier"));
 
     value.deinit(allocator);
@@ -2078,7 +2070,7 @@ test "JSON5.3; parseEcmaScript51Identifier can parse simple identifier /2" {
 
     var buffer = bufferFromText("\\u005FsomeIdentifier");
     const value = try parseEcmaScript51Identifier(allocator, &buffer);
-    try std.testing.expectEqual(value.type, JsonType.string);
+    try std.testing.expect(value.value == .string);
     try std.testing.expect(std.mem.eql(u8, value.string(), "\u{005f}someIdentifier"));
 
     value.deinit(allocator);
@@ -2093,26 +2085,26 @@ test "JSON5.3: parseObject can parse a simple object /1" {
 
     var buffer = bufferFromText("{key1: \"foo\", ȡkey2: \"foo2\", \u{0221}key3 : -1, 'key4': [], \"key5\": { } }");
     var jsonResult = try parseObject(allocator, &buffer, CONFIG_JSON5);
-    try std.testing.expectEqual(jsonResult.type, JsonType.object);
+    try std.testing.expect(jsonResult.value == .object);
 
     try std.testing.expectEqual(jsonResult.object().contains("key1"), true);
-    try std.testing.expectEqual(jsonResult.get("key1").type, JsonType.string);
+    try std.testing.expect(jsonResult.get("key1").value == .string);
     try std.testing.expect(std.mem.eql(u8, jsonResult.get("key1").string(), "foo"));
 
     try std.testing.expectEqual(jsonResult.object().contains("\u{0221}key2"), true);
-    try std.testing.expectEqual(jsonResult.get("\u{0221}key2").type, JsonType.string);
+    try std.testing.expect(jsonResult.get("\u{0221}key2").value == .string);
     try std.testing.expect(std.mem.eql(u8, jsonResult.get("\u{0221}key2").string(), "foo2"));
 
     try std.testing.expectEqual(jsonResult.object().contains("ȡkey3"), true);
-    try std.testing.expectEqual(jsonResult.get("ȡkey3").type, JsonType.integer);
+    try std.testing.expect(jsonResult.get("ȡkey3").value == .integer);
     try std.testing.expectEqual(jsonResult.get("ȡkey3").integer(), -1);
 
     try std.testing.expectEqual(jsonResult.object().contains("key4"), true);
-    try std.testing.expectEqual(jsonResult.get("key4").type, JsonType.array);
+    try std.testing.expect(jsonResult.get("key4").value == .array);
     try std.testing.expectEqual(jsonResult.get("key4").len(), 0);
 
     try std.testing.expectEqual(jsonResult.object().contains("key5"), true);
-    try std.testing.expectEqual(jsonResult.get("key5").type, JsonType.object);
+    try std.testing.expect(jsonResult.get("key5").value == .object);
     try std.testing.expectEqual(jsonResult.get("key5").len(), 0);
 
     jsonResult.deinit(allocator);
@@ -2127,26 +2119,26 @@ test "JSON5.3: parseObject can parse a simple object with trailing comma" {
 
     var buffer = bufferFromText("{key1: \"foo\", ȡkey2: \"foo2\", \u{0221}key3 : -1, 'key4': [], \"key5\": { }, }");
     var jsonResult = try parseObject(allocator, &buffer, CONFIG_JSON5);
-    try std.testing.expectEqual(jsonResult.type, JsonType.object);
+    try std.testing.expect(jsonResult.value == .object);
 
     try std.testing.expectEqual(jsonResult.object().contains("key1"), true);
-    try std.testing.expectEqual(jsonResult.get("key1").type, JsonType.string);
+    try std.testing.expect(jsonResult.get("key1").value == .string);
     try std.testing.expect(std.mem.eql(u8, jsonResult.get("key1").string(), "foo"));
 
     try std.testing.expectEqual(jsonResult.object().contains("\u{0221}key2"), true);
-    try std.testing.expectEqual(jsonResult.get("\u{0221}key2").type, JsonType.string);
+    try std.testing.expect(jsonResult.get("\u{0221}key2").value == .string);
     try std.testing.expect(std.mem.eql(u8, jsonResult.get("\u{0221}key2").string(), "foo2"));
 
     try std.testing.expectEqual(jsonResult.object().contains("ȡkey3"), true);
-    try std.testing.expectEqual(jsonResult.get("ȡkey3").type, JsonType.integer);
+    try std.testing.expect(jsonResult.get("ȡkey3").value == .integer);
     try std.testing.expectEqual(jsonResult.get("ȡkey3").integer(), -1);
 
     try std.testing.expectEqual(jsonResult.object().contains("key4"), true);
-    try std.testing.expectEqual(jsonResult.get("key4").type, JsonType.array);
+    try std.testing.expect(jsonResult.get("key4").value == .array);
     try std.testing.expectEqual(jsonResult.get("key4").len(), 0);
 
     try std.testing.expectEqual(jsonResult.object().contains("key5"), true);
-    try std.testing.expectEqual(jsonResult.get("key5").type, JsonType.object);
+    try std.testing.expect(jsonResult.get("key5").value == .object);
     try std.testing.expectEqual(jsonResult.get("key5").len(), 0);
 
     jsonResult.deinit(allocator);
@@ -2161,7 +2153,7 @@ test "JSON5.4 parseArray can parse a simple array /1" {
 
     var buffer = bufferFromText("[1, \"two\", 3.0, {}, 'five', {six: 0x07}]");
     const value = try parseArray(allocator, &buffer, CONFIG_JSON5);
-    try std.testing.expectEqual(value.type, JsonType.array);
+    try std.testing.expect(value.value == .array);
     try std.testing.expectEqual(value.get(0).integer(), 1);
     try std.testing.expect(std.mem.eql(u8, value.get(1).string(), "two"));
     try std.testing.expectEqual(value.get(2).float(), 3.0);
@@ -2235,19 +2227,19 @@ test "JSON5.6 parseNumber can parse nan" {
 
     var buffer1 = bufferFromText("NaN");
     var value = try parseNumber(allocator, &buffer1, CONFIG_JSON5);
-    try std.testing.expectEqual(JsonType.float, value.type);
+    try std.testing.expect(value.value == .float);
     try std.testing.expectEqual(value, &JSON_POSITIVE_NAN);
     try std.testing.expect(std.math.isNan(value.float()));
 
     var buffer2 = bufferFromText("+NaN");
     value = try parseNumber(allocator, &buffer2, CONFIG_JSON5);
-    try std.testing.expectEqual(JsonType.float, value.type);
+    try std.testing.expect(value.value == .float);
     try std.testing.expectEqual(value, &JSON_POSITIVE_NAN);
     try std.testing.expect(std.math.isNan(value.float()));
 
     var buffer3 = bufferFromText("-NaN");
     value = try parseNumber(allocator, &buffer3, CONFIG_JSON5);
-    try std.testing.expectEqual(JsonType.float, value.type);
+    try std.testing.expect(value.value == .float);
     try std.testing.expectEqual(value, &JSON_NEGATIVE_NAN);
     try std.testing.expect(std.math.isNan(value.float()));
 
@@ -2261,7 +2253,7 @@ test "JSON5.7 parseArray ignores multi-line comments" {
 
     var buffer = bufferFromText("/* comment */[/* comment */1/* comment */,/* comment */\"two\"/* comment */,/* comment */3.0/* comment */,/* comment */{/* comment */},/* comment */'five'/* comment */,/* comment */{/* comment */six/* comment */:/* comment */0x07/* comment */}/* comment */]/* comment */");
     const value = try parseArray(allocator, &buffer, CONFIG_JSON5);
-    try std.testing.expectEqual(value.type, JsonType.array);
+    try std.testing.expect(value.value == .array);
     try std.testing.expectEqual(value.get(0).integer(), 1);
     try std.testing.expect(std.mem.eql(u8, value.get(1).string(), "two"));
     try std.testing.expectEqual(value.get(2).float(), 3.0);
@@ -2281,7 +2273,7 @@ test "JSON5.7 parseArray ignores single-line comments" {
 
     var buffer = bufferFromText("// comment \n[// comment \n1// comment \n,// comment \n\"two\"// comment \n,// comment \n3.0// comment \n,// comment \n{// comment \n},// comment \n'five'// comment \n,// comment \n{// comment \nsix// comment \n:// comment \n0x07// comment \n}// comment \n]// comment \n");
     const value = try parseArray(allocator, &buffer, CONFIG_JSON5);
-    try std.testing.expectEqual(value.type, JsonType.array);
+    try std.testing.expect(value.value == .array);
     try std.testing.expectEqual(value.get(0).integer(), 1);
     try std.testing.expect(std.mem.eql(u8, value.get(1).string(), "two"));
     try std.testing.expectEqual(value.get(2).float(), 3.0);
@@ -2301,26 +2293,26 @@ test "JSON5.7: parseObject ignores multi-line comments" {
 
     var buffer = bufferFromText("/* comment */{/* comment */key1/* comment */:/* comment */\"foo\"/* comment */,/* comment */ȡkey2/* comment */:/* comment */\"foo2\"/* comment */,/* comment */\u{0221}key3/* comment */:/* comment */-1/* comment */,/* comment */'key4'/* comment */:/* comment */[/* comment */]/* comment */,/* comment */\"key5\"/* comment */:/* comment */{/* comment */}/* comment */,/* comment */}/* comment */");
     var jsonResult = try parseObject(allocator, &buffer, CONFIG_JSON5);
-    try std.testing.expectEqual(jsonResult.type, JsonType.object);
+    try std.testing.expect(jsonResult.value == .object);
 
     try std.testing.expectEqual(jsonResult.object().contains("key1"), true);
-    try std.testing.expectEqual(jsonResult.get("key1").type, JsonType.string);
+    try std.testing.expect(jsonResult.get("key1").value == .string);
     try std.testing.expect(std.mem.eql(u8, jsonResult.get("key1").string(), "foo"));
 
     try std.testing.expectEqual(jsonResult.object().contains("\u{0221}key2"), true);
-    try std.testing.expectEqual(jsonResult.get("\u{0221}key2").type, JsonType.string);
+    try std.testing.expect(jsonResult.get("\u{0221}key2").value == .string);
     try std.testing.expect(std.mem.eql(u8, jsonResult.get("\u{0221}key2").string(), "foo2"));
 
     try std.testing.expectEqual(jsonResult.object().contains("ȡkey3"), true);
-    try std.testing.expectEqual(jsonResult.get("ȡkey3").type, JsonType.integer);
+    try std.testing.expect(jsonResult.get("ȡkey3").value == .integer);
     try std.testing.expectEqual(jsonResult.get("ȡkey3").integer(), -1);
 
     try std.testing.expectEqual(jsonResult.object().contains("key4"), true);
-    try std.testing.expectEqual(jsonResult.get("key4").type, JsonType.array);
+    try std.testing.expect(jsonResult.get("key4").value == .array);
     try std.testing.expectEqual(jsonResult.get("key4").len(), 0);
 
     try std.testing.expectEqual(jsonResult.object().contains("key5"), true);
-    try std.testing.expectEqual(jsonResult.get("key5").type, JsonType.object);
+    try std.testing.expect(jsonResult.get("key5").value == .object);
     try std.testing.expectEqual(jsonResult.get("key5").len(), 0);
 
     jsonResult.deinit(allocator);
@@ -2335,26 +2327,26 @@ test "JSON5.7: parseObject ignores single-line comments" {
 
     var buffer = bufferFromText("// comment \n{// comment \nkey1// comment \n:// comment \n\"foo\"// comment \n,// comment \nȡkey2// comment \n:// comment \n\"foo2\"// comment \n,// comment \n\u{0221}key3// comment \n:// comment \n-1// comment \n,// comment \n'key4'// comment \n:// comment \n[// comment \n]// comment \n,// comment \n\"key5\"// comment \n:// comment \n{// comment \n}// comment \n,// comment \n}// comment \n");
     var jsonResult = try parseObject(allocator, &buffer, CONFIG_JSON5);
-    try std.testing.expectEqual(jsonResult.type, JsonType.object);
+    try std.testing.expect(jsonResult.value == .object);
 
     try std.testing.expectEqual(jsonResult.object().contains("key1"), true);
-    try std.testing.expectEqual(jsonResult.get("key1").type, JsonType.string);
+    try std.testing.expect(jsonResult.get("key1").value == .string);
     try std.testing.expect(std.mem.eql(u8, jsonResult.get("key1").string(), "foo"));
 
     try std.testing.expectEqual(jsonResult.object().contains("\u{0221}key2"), true);
-    try std.testing.expectEqual(jsonResult.get("\u{0221}key2").type, JsonType.string);
+    try std.testing.expect(jsonResult.get("\u{0221}key2").value == .string);
     try std.testing.expect(std.mem.eql(u8, jsonResult.get("\u{0221}key2").string(), "foo2"));
 
     try std.testing.expectEqual(jsonResult.object().contains("ȡkey3"), true);
-    try std.testing.expectEqual(jsonResult.get("ȡkey3").type, JsonType.integer);
+    try std.testing.expect(jsonResult.get("ȡkey3").value == .integer);
     try std.testing.expectEqual(jsonResult.get("ȡkey3").integer(), -1);
 
     try std.testing.expectEqual(jsonResult.object().contains("key4"), true);
-    try std.testing.expectEqual(jsonResult.get("key4").type, JsonType.array);
+    try std.testing.expect(jsonResult.get("key4").value == .array);
     try std.testing.expectEqual(jsonResult.get("key4").len(), 0);
 
     try std.testing.expectEqual(jsonResult.object().contains("key5"), true);
-    try std.testing.expectEqual(jsonResult.get("key5").type, JsonType.object);
+    try std.testing.expect(jsonResult.get("key5").value == .object);
     try std.testing.expectEqual(jsonResult.get("key5").len(), 0);
 
     jsonResult.deinit(allocator);
@@ -2419,7 +2411,8 @@ test "README.md simple test" {
     const value = try parseBuffer(allocator, &buffer);
     const bazObj = value.get("foo").get(4);
 
-    bazObj.print(null);
+    try bazObj.serialize(std.io.getStdErr().writer(), .SPACES_2, 0);
+
     try std.testing.expectEqual(bazObj.get("baz").float(), -13e+37);
 
     defer value.deinit(allocator);
@@ -2452,7 +2445,8 @@ test "README.md simple test json5" {
     const value = try parseJson5Buffer(allocator, &buffer);
     const bazObj = value.get("foo").get(4);
 
-    bazObj.print(null);
+    try bazObj.serialize(std.io.getStdErr().writer(), .SPACES_2, 0);
+
     try std.testing.expectEqual(bazObj.get("baz").float(), -13e+37);
 
     defer value.deinit(allocator);
@@ -2485,7 +2479,8 @@ test "README.md simple test with stream source" {
     const value = try parseJson5Buffer(allocator, &buffer);
     const bazObj = value.get("foo").get(4);
 
-    bazObj.print(null);
+    try bazObj.serialize(std.io.getStdErr().writer(), .SPACES_2, 0);
+
     try std.testing.expectEqual(bazObj.get("baz").float(), -13e+37);
 
     defer value.deinit(allocator);
@@ -2505,7 +2500,8 @@ test "README.md simple test from file" {
 
     const bazObj = value.get("foo").get(4);
 
-    bazObj.print(null);
+    try bazObj.serialize(std.io.getStdErr().writer(), .SPACES_2, 0);
+
     try std.testing.expectEqual(bazObj.get("baz").float(), -13e+37);
 }
 
