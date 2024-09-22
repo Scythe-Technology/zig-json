@@ -65,6 +65,7 @@ pub const Buffer = struct {
         return switch (self.buffer) {
             BufferType.jsonString => |js| {
                 defer self.position += 1;
+                if (self.position >= js.len) return BufferErrors.OutOfBounds;
                 self.last = js[try self.getPos()];
                 return self.last.?;
             },
@@ -91,9 +92,10 @@ pub const Buffer = struct {
     /// Reads buffer.len worth of bytes into buffer
     pub fn read(self: *Buffer, buffer: []u8) BufferErrors!u64 {
         return switch (self.buffer) {
-            BufferType.jsonString => {
+            BufferType.jsonString => |js| {
                 var index: u64 = 0;
                 while (index != buffer.len) {
+                    if (self.position >= js.len) break;
                     buffer[index] = try self.readByte();
                     index += 1;
                 }
@@ -150,7 +152,10 @@ pub const Buffer = struct {
     /// Returns the next byte but doesn't advance the read position
     pub fn peek(self: *Buffer) BufferErrors!u8 {
         return switch (self.buffer) {
-            BufferType.jsonString => |js| js[try self.getPos()],
+            BufferType.jsonString => |js| {
+                if (self.position >= js.len) return BufferErrors.OutOfBounds;
+                return js[try self.getPos()];
+            },
             BufferType.streamSource => |ss| {
                 if (self.peekByte) |pb| return pb;
                 self.peekByte = ss.reader().readByte() catch return BufferErrors.ReadError;
@@ -161,7 +166,10 @@ pub const Buffer = struct {
     /// Returns the second next byte but doesn't advance the read position
     pub fn peekNext(self: *Buffer) BufferErrors!u8 {
         return switch (self.buffer) {
-            BufferType.jsonString => |js| js[try self.getPos() + 1],
+            BufferType.jsonString => |js| {
+                if (self.position + 1 >= js.len) return BufferErrors.OutOfBounds;
+                return js[try self.getPos() + 1];
+            },
             BufferType.streamSource => |ss| {
                 if (self.peekNextByte) |pb| return pb;
                 if (self.peekByte == null) _ = try self.peek();
@@ -179,7 +187,7 @@ pub const Buffer = struct {
 
 pub const BufferErrors = BufferError;
 
-pub const BufferError = error{ReadError};
+pub const BufferError = error{ ReadError, OutOfBounds };
 
 pub fn bufferFromText(text: []const u8) Buffer {
     return Buffer{ .buffer = .{ .jsonString = text } };
