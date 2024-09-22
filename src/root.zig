@@ -1,11 +1,6 @@
 ///! Simple JSON parsing library with a focus on a simple, usable API.
 const std = @import("std");
 
-const Buffer = @import("buffer.zig").Buffer;
-const BufferErrors = @import("buffer.zig").BufferErrors;
-const bufferFromText = @import("buffer.zig").bufferFromText;
-const bufferFromStreamSource = @import("buffer.zig").bufferFromStreamSource;
-
 const Allocator = std.mem.Allocator;
 
 /// Enable to get debug logging during parsing
@@ -112,7 +107,7 @@ pub const ParseError = error{
 };
 
 /// All parser errors including allocation, and int/float parsing errors.
-pub const ParseErrors = ParseError || Allocator.Error || std.fmt.ParseIntError || std.fmt.ParseFloatError || BufferErrors;
+pub const ParseErrors = ParseError || Allocator.Error || std.fmt.ParseIntError || std.fmt.ParseFloatError;
 
 /// Allows callers to configure which parser style to use.
 pub const ParserConfig = struct { parserType: ParserType = ParserType.rfc8259 };
@@ -422,103 +417,91 @@ var JSON_NEGATIVE_NAN = JsonValue{ .float = -std.math.nan(f64) };
 
 /// Parse a JSON5 string using the provided allocator
 pub fn parse(allocator: Allocator, jsonString: []const u8) !JsonRoot {
-    var buffer = bufferFromText(jsonString);
-    const value = try parseValue(allocator, &buffer, CONFIG_RFC8259);
-    return JsonRoot.init(allocator, value);
-}
-
-fn parseBuffer(allocator: Allocator, buffer: *Buffer) !JsonRoot {
-    const value = try parseValue(allocator, buffer, CONFIG_RFC8259);
+    _, const value = try parseValue(allocator, jsonString, CONFIG_RFC8259);
     return JsonRoot.init(allocator, value);
 }
 
 /// Parse a JSON5 string using the provided allocator
 pub fn parseJson5(allocator: Allocator, jsonString: []const u8) !JsonRoot {
-    var buffer = bufferFromText(jsonString);
-    const value = try parseValue(allocator, &buffer, CONFIG_JSON5);
-    return JsonRoot.init(allocator, value);
-}
-
-fn parseJson5Buffer(allocator: Allocator, buffer: *Buffer) !JsonRoot {
-    const value = try parseValue(allocator, buffer, CONFIG_JSON5);
-    return JsonRoot.init(allocator, value);
-}
-
-fn internalParse(allocator: Allocator, buffer: *Buffer, config: ParserConfig) !JsonRoot {
-    // Walk through each token
-    const value = try parseValue(allocator, buffer, config);
+    _, const value = try parseValue(allocator, jsonString, CONFIG_JSON5);
     return JsonRoot.init(allocator, value);
 }
 
 /// Parse a JSON value from the provided slice
 /// Returns the index of the next character to read
-fn parseValue(allocator: Allocator, buffer: *Buffer, config: ParserConfig) ParseErrors!JsonValue {
-    try skipWhiteSpaces(buffer, config);
-    const char = try buffer.peek();
+fn parseValue(allocator: Allocator, buffer: []const u8, config: ParserConfig) ParseErrors!struct { usize, JsonValue } {
+    if (buffer.len == 0) return error.ParseValueError;
+    var pos: usize = try trimLeftWhitespace(buffer, config);
+    const char = buffer[pos];
     const result = result: {
         switch (char) {
             // { indicates an object
             TOKEN_CURLY_BRACKET_OPEN => {
-                const result = try parseObject(allocator, buffer, config);
+                const read_pos, const result = try parseObject(allocator, buffer[pos..], config);
+                pos += read_pos;
                 break :result result;
             },
             // [ indicates an array
             TOKEN_BRACKET_OPEN => {
-                const result = try parseArray(allocator, buffer, config);
+                const read_pos, const result = try parseArray(allocator, buffer[pos..], config);
+                pos += read_pos;
                 break :result result;
             },
             // " indicates a string
             TOKEN_DOUBLE_QUOTE => {
-                const result = try parseStringWithTerminal(allocator, buffer, config, TOKEN_DOUBLE_QUOTE);
+                const read_pos, const result = try parseStringWithTerminal(allocator, buffer[pos..], config, TOKEN_DOUBLE_QUOTE);
+                pos += read_pos;
                 break :result result;
             },
             else => {},
         }
         // ' indicates a string (json5)
         if (config.parserType == ParserType.json5 and char == TOKEN_SINGLE_QUOTE) {
-            const result = try parseStringWithTerminal(allocator, buffer, config, TOKEN_SINGLE_QUOTE);
+            const read_pos, const result = try parseStringWithTerminal(allocator, buffer[pos..], config, TOKEN_SINGLE_QUOTE);
+            pos += read_pos;
             break :result result;
         }
 
         // 0-9|- indicates a number
-        if (try isReservedInfinity(buffer) or try isReservedNan(buffer) or isNumberOrPlusOrMinus(char)) {
-            const result = try parseNumber(allocator, buffer, config);
+        if (isReservedInfinity(buffer[pos..]) or isReservedNan(buffer[pos..]) or isNumberOrPlusOrMinus(char)) {
+            const read_pos, const result = try parseNumber(allocator, buffer[pos..], config);
+            pos += read_pos;
             break :result result;
         }
 
-        if (try isReservedTrue(buffer)) {
-            try expectWord(buffer, TOKEN_TRUE);
-            try expectNothingNext(buffer, config);
+        if (isReservedTrue(buffer[pos..])) {
+            pos += try expectWord(buffer[pos..], TOKEN_TRUE);
+            try expectNothingNext(buffer[pos..], config);
             break :result JSON_TRUE;
         }
 
-        if (try isReservedFalse(buffer)) {
-            try expectWord(buffer, TOKEN_FALSE);
-            try expectNothingNext(buffer, config);
+        if (isReservedFalse(buffer[pos..])) {
+            pos += try expectWord(buffer[pos..], TOKEN_FALSE);
+            try expectNothingNext(buffer[pos..], config);
             break :result JSON_FALSE;
         }
 
-        if (try isReservedNull(buffer)) {
-            try expectWord(buffer, TOKEN_NULL);
-            try expectNothingNext(buffer, config);
+        if (isReservedNull(buffer[pos..])) {
+            pos += try expectWord(buffer[pos..], TOKEN_NULL);
+            try expectNothingNext(buffer[pos..], config);
             break :result JSON_NULL;
         }
 
-        var leftOverBuffer: [16]u8 = undefined;
-        _ = try buffer.read(&leftOverBuffer);
-        debug("Unable to parse value from \"{s}...\"", .{leftOverBuffer});
+        var remaining = buffer[pos..];
+        if (remaining.len > 16) remaining = remaining[0..16];
+        debug("Unable to parse value from \"{s}...\"", .{remaining});
 
         return error.ParseValueError;
     };
 
-    return result;
+    return .{ pos, result };
 }
 
 /// Parse a JSON object from the provided slice
 /// Returns the index of the next character to read
 /// Note: parseObject _assumes_ the leading { has been stripped and jsonString
 ///  starts after that point.
-fn parseObject(allocator: Allocator, buffer: *Buffer, config: ParserConfig) ParseErrors!JsonValue {
+fn parseObject(allocator: Allocator, buffer: []const u8, config: ParserConfig) ParseErrors!struct { usize, JsonValue } {
     const ptr = try allocator.create(std.StringArrayHashMap(JsonValue));
     ptr.* = std.StringArrayHashMap(JsonValue).init(allocator);
     const jsonValue = JsonValue{ .object = ptr };
@@ -527,51 +510,59 @@ fn parseObject(allocator: Allocator, buffer: *Buffer, config: ParserConfig) Pars
 
     var wasLastComma = false;
     var closed = false;
-    try expect(buffer, config, TOKEN_CURLY_BRACKET_OPEN);
-    while (try buffer.getPos() < try buffer.getEndPos()) {
-        const char = try buffer.peek();
+    var pos: usize = 0;
+    pos += try expect(buffer, config, TOKEN_CURLY_BRACKET_OPEN);
+    while (pos < buffer.len) {
+        const char = buffer[pos];
         if (char == TOKEN_CURLY_BRACKET_CLOSE) {
             closed = true;
             break;
         }
         // Skip comments
-        if (try isComment(buffer)) {
-            try skipComment(buffer);
+        if (isComment(buffer[pos..])) {
+            pos += try skipComment(buffer[pos..]);
             continue;
         }
         if (char == TOKEN_COMMA or isInsignificantWhitespace(char, config)) {
             wasLastComma = char == TOKEN_COMMA or wasLastComma;
-            try buffer.skipBytes(1);
+            pos += 1;
             continue;
         }
 
         if (jsonObject.count() > 0 and !wasLastComma) {
-            debug("Unexpected token; expected ',' but found a '{?}' instead", .{buffer.lastByte()});
+            debug("Unexpected token; expected ',' but found a '{c}' instead", .{buffer[pos]});
             return error.UnexpectedTokenError;
         }
         wasLastComma = false;
 
         var key = key: {
             if (char == TOKEN_DOUBLE_QUOTE) {
-                break :key try parseStringWithTerminal(allocator, buffer, config, TOKEN_DOUBLE_QUOTE);
+                const read_pos, const value = try parseStringWithTerminal(allocator, buffer[pos..], config, TOKEN_DOUBLE_QUOTE);
+                pos += read_pos;
+                break :key value;
             }
             if (config.parserType == ParserType.json5 and char == TOKEN_SINGLE_QUOTE) {
-                break :key try parseStringWithTerminal(allocator, buffer, config, TOKEN_SINGLE_QUOTE);
+                const read_pos, const value = try parseStringWithTerminal(allocator, buffer[pos..], config, TOKEN_SINGLE_QUOTE);
+                pos += read_pos;
+                break :key value;
             }
-            if (config.parserType == ParserType.json5 and try isStartOfEcmaScript51Identifier(buffer)) {
-                break :key try parseEcmaScript51Identifier(allocator, buffer);
+            if (config.parserType == ParserType.json5 and isStartOfEcmaScript51Identifier(buffer[pos..])) {
+                const read_pos, const value = try parseEcmaScript51Identifier(allocator, buffer[pos..]);
+                pos += read_pos;
+                break :key value;
             }
             return error.ParseObjectError;
         };
         defer key.deinit(allocator);
 
-        try expect(buffer, config, TOKEN_COLON);
+        pos += try expect(buffer[pos..], config, TOKEN_COLON);
 
         const key_string = try allocator.dupe(u8, key.asString());
         errdefer allocator.free(key_string);
 
-        var value = try parseValue(allocator, buffer, config);
+        const read_pos, const value = try parseValue(allocator, buffer[pos..], config);
         errdefer value.deinit(allocator);
+        pos += read_pos;
         try jsonObject.put(key_string, value);
     }
 
@@ -581,16 +572,16 @@ fn parseObject(allocator: Allocator, buffer: *Buffer, config: ParserConfig) Pars
     }
 
     // Account for the terminal character
-    try buffer.skipBytes(1);
+    pos += 1;
 
-    return jsonValue;
+    return .{ pos, jsonValue };
 }
 
 /// Parse a JSON array from the provided slice
 /// Returns the index of the next character to read
 /// Note: parseArray _assumes_ the leading [ has been stripped and jsonString
 ///  starts after that point.
-fn parseArray(allocator: Allocator, buffer: *Buffer, config: ParserConfig) ParseErrors!JsonValue {
+fn parseArray(allocator: Allocator, buffer: []const u8, config: ParserConfig) ParseErrors!struct { usize, JsonValue } {
     const ptr = try allocator.create(std.ArrayList(JsonValue));
     ptr.* = std.ArrayList(JsonValue).init(allocator);
     const jsonValue = JsonValue{ .array = ptr };
@@ -599,183 +590,209 @@ fn parseArray(allocator: Allocator, buffer: *Buffer, config: ParserConfig) Parse
 
     // Flag to indicate if we've already seen a comma
     var wasLastComma = false;
-    try expect(buffer, config, TOKEN_BRACKET_OPEN);
-    while (try buffer.getPos() < try buffer.getEndPos() and try buffer.peek() != TOKEN_BRACKET_CLOSE) {
+    var pos: usize = try expect(buffer, config, TOKEN_BRACKET_OPEN);
+    while (pos < buffer.len and buffer[pos] != TOKEN_BRACKET_CLOSE) {
         // Skip comments
-        if (try isComment(buffer)) {
-            try skipComment(buffer);
+        if (isComment(buffer[pos..])) {
+            pos += try skipComment(buffer[pos..]);
             continue;
         }
+
         // Skip commas and insignificant whitespaces
-        if (try buffer.peek() == TOKEN_COMMA or isInsignificantWhitespace(try buffer.peek(), config)) {
-            wasLastComma = try buffer.readByte() == TOKEN_COMMA or wasLastComma;
+        if (buffer[pos] == TOKEN_COMMA or isInsignificantWhitespace(buffer[pos], config)) {
+            wasLastComma = buffer[pos] == TOKEN_COMMA or wasLastComma;
+            pos += 1;
             continue;
         }
+
         wasLastComma = false;
-        var value = try parseValue(allocator, buffer, config);
+        const read_pos, const value = try parseValue(allocator, buffer[pos..], config);
         errdefer value.deinit(allocator);
+        pos += read_pos;
         try jsonArray.append(value);
     }
 
-    if (wasLastComma and config.parserType != ParserType.json5) {
-        return error.UnexpectedTokenError;
-    }
+    if (wasLastComma and config.parserType != ParserType.json5) return error.UnexpectedTokenError;
 
     // Account for the terminal character
-    try buffer.skipBytes(1);
+    pos += 1;
 
-    return jsonValue;
+    return .{ pos, jsonValue };
 }
 
 /// Parse a string from the provided slice
 /// Returns the index of the next character to read
-fn parseStringWithTerminal(allocator: Allocator, buffer: *Buffer, config: ParserConfig, terminal: u8) ParseErrors!JsonValue {
-    try expectUpTo(buffer, config, terminal);
+fn parseStringWithTerminal(allocator: Allocator, buffer: []const u8, config: ParserConfig, terminal: u8) ParseErrors!struct { usize, JsonValue } {
+    const ipos = try expectUpTo(buffer, config, terminal);
     var slashCount: usize = 0;
     var characters = std.ArrayList(u8).init(allocator);
     defer characters.deinit();
-    while (try buffer.getPos() < try buffer.getEndPos() and (try buffer.peek() != terminal or slashCount % 2 == 1)) : (try buffer.skipBytes(1)) {
-        // Track escaping
-        if (try buffer.peek() == TOKEN_REVERSE_SOLIDUS) {
-            slashCount += 1;
 
-            if (slashCount % 2 == 0) {
-                try characters.append(try buffer.peek());
-            }
-        } else {
-            defer slashCount = 0;
-            if (slashCount == 1) { // \
-                const peak = try buffer.peek();
-                if (peak == 'u') {
-                    try buffer.skipBytes(1);
-                    var codepoint: [4]u8 = undefined;
-                    if (try buffer.read(codepoint[0..3]) != 3) return error.ParseStringError;
-                    codepoint[3] = try buffer.peek();
-                    var b: [4]u8 = undefined;
-                    const bytes = std.fmt.hexToBytes(&b, codepoint[0..4]) catch return error.ParseStringError;
-                    const trimmed = b: {
-                        for (bytes, 0..) |byte, p| if (byte != 0) break :b bytes[p..];
-                        break :b bytes[bytes.len - 1 ..];
-                    };
-                    try characters.appendSlice(trimmed);
-                } else {
-                    switch (peak) {
-                        'b' => try characters.append(8),
-                        't' => try characters.append(9),
-                        'n' => try characters.append(10),
-                        'f' => try characters.append(12),
-                        'r' => try characters.append(13),
-                        '"' => try characters.append('"'),
-                        '\\' => try characters.append('\\'),
-                        else => return error.ParseStringError,
+    var pos: usize = ipos;
+    while (pos < buffer.len) : (pos += 1) {
+        const c = buffer[pos];
+        if (c == terminal and slashCount % 2 == 0) break;
+        switch (c) {
+            TOKEN_REVERSE_SOLIDUS => {
+                slashCount += 1;
+                if (slashCount % 2 == 0) try characters.append(c);
+            },
+            else => {
+                defer slashCount = 0;
+                if (slashCount == 1) {
+                    if (c == 'u') {
+                        if (buffer.len < pos + 6) return error.ParseStringError;
+                        const intValue = try std.fmt.parseInt(u21, buffer[pos + 1 .. pos + 5], 16);
+                        var buf: [4]u8 = undefined;
+                        const len = try std.unicode.utf8Encode(intValue, &buf);
+                        var li: usize = 0;
+                        while (li < len) : (li += 1) try characters.append(buf[li]);
+                        pos += 4;
+                    } else {
+                        switch (c) {
+                            'b' => try characters.append(8),
+                            't' => try characters.append(9),
+                            'n' => try characters.append(10),
+                            'f' => try characters.append(12),
+                            'r' => try characters.append(13),
+                            '"' => try characters.append('"'),
+                            '\\' => try characters.append('\\'),
+                            else => return error.ParseStringError,
+                        }
                     }
-                }
-            } else {
-                try characters.append(try buffer.peek());
-            }
+                } else try characters.append(c);
+            },
         }
     }
 
-    if (try buffer.getPos() >= try buffer.getEndPos()) return error.ParseStringError;
+    if (pos >= buffer.len) return error.ParseStringError;
 
-    try buffer.skipBytes(1);
+    pos += 1;
 
-    return .{ .string = try allocator.dupe(u8, characters.items) };
+    return .{ pos, .{ .string = try allocator.dupe(u8, characters.items) } };
 }
 
 /// Parse a number from the provided slice
 /// Returns the index of the next character to read
-fn parseNumber(allocator: Allocator, buffer: *Buffer, config: ParserConfig) ParseErrors!JsonValue {
+fn parseNumber(allocator: Allocator, buffer: []const u8, config: ParserConfig) ParseErrors!struct { usize, JsonValue } {
     var encodingType = NumberEncoding.integer;
-    try skipWhiteSpaces(buffer, config);
+    var pos = try trimLeftWhitespace(buffer, config);
     var startingDigitAt: usize = 0;
     var polarity: isize = 1;
     var numberList = std.ArrayList(u8).init(allocator);
     defer numberList.deinit();
 
-    if (try buffer.getPos() >= try buffer.getEndPos()) {
+    if (buffer[pos..].len < 1) {
         debug("Number cannot be zero length", .{});
         return error.ParseNumberError;
     }
 
+    const new_buffer = buffer[pos..];
+
     // First character can be a minus or number
-    if (config.parserType == ParserType.json5 and isPlusOrMinus(try buffer.peek()) or config.parserType == ParserType.rfc8259 and try buffer.peek() == TOKEN_MINUS) {
-        polarity = if (try buffer.readByte() == TOKEN_MINUS) -1 else 1;
-        try numberList.append(buffer.lastByte().?);
+    if (config.parserType == ParserType.json5 and isPlusOrMinus(new_buffer[0]) or config.parserType == ParserType.rfc8259 and new_buffer[0] == TOKEN_MINUS) {
+        polarity = if (new_buffer[0] == TOKEN_MINUS) -1 else 1;
+        try numberList.append(new_buffer[0]);
         startingDigitAt += 1;
+        pos += 1;
     }
 
-    if (try buffer.getPos() >= try buffer.getEndPos()) {
-        debug("Invalid number; cannot be just + or -", .{});
+    if (new_buffer.len <= startingDigitAt) {
+        if (startingDigitAt > 0) debug("Invalid number; cannot be just + or -", .{});
         return error.ParseNumberError;
     }
 
-    if (config.parserType == ParserType.json5 and try isReservedInfinity(buffer)) {
-        try expectWord(buffer, TOKEN_INFINITY);
-        return if (polarity > 0) JSON_POSITIVE_INFINITY else JSON_NEGATIVE_INFINITY;
+    if (config.parserType == ParserType.json5 and isReservedInfinity(buffer[pos..])) {
+        pos += try expectWord(buffer[pos..], TOKEN_INFINITY);
+        return .{ pos, if (polarity > 0) JSON_POSITIVE_INFINITY else JSON_NEGATIVE_INFINITY };
     }
 
-    if (config.parserType == ParserType.json5 and try isReservedNan(buffer)) {
-        try expectWord(buffer, TOKEN_NAN);
-        return if (polarity > 0) JSON_POSITIVE_NAN else JSON_NEGATIVE_NAN;
+    if (config.parserType == ParserType.json5 and isReservedNan(buffer[pos..])) {
+        pos += try expectWord(buffer[pos..], TOKEN_NAN);
+        return .{ pos, if (polarity > 0) JSON_POSITIVE_NAN else JSON_NEGATIVE_NAN };
     }
 
     // Next character either is a digit or a .
-    if (try buffer.peek() == '0') {
-        try numberList.append(try buffer.readByte());
-        if (try buffer.getPos() < try buffer.getEndPos()) {
-            if (try buffer.peek() == TOKEN_ZERO) {
-                debug("Invalid number; number cannot start with multiple zeroes", .{});
+
+    switch (buffer[pos]) {
+        '0' => {
+            try numberList.append('0');
+            pos += 1;
+            if (pos < buffer.len) {
+                switch (buffer[pos]) {
+                    TOKEN_ZERO => {
+                        debug("Invalid number; number cannot start with multiple zeroes", .{});
+                        return error.ParseNumberError;
+                    },
+                    'x' => {
+                        encodingType = NumberEncoding.hex;
+                        try numberList.append('x');
+                        pos += 1;
+                    },
+                    else => {},
+                }
+            }
+        },
+        49...57 => {
+            try numberList.append(buffer[pos]);
+            pos += 1;
+        },
+        TOKEN_PERIOD => {
+            if (config.parserType == ParserType.rfc8259) {
+                debug("Invalid number; RFS8259 doesn't support floating point numbers starting with a decimal point", .{});
                 return error.ParseNumberError;
             }
-            if (try buffer.peek() == 'x') {
-                encodingType = NumberEncoding.hex;
-                try numberList.append(try buffer.readByte());
-            }
-        }
-    } else if (isNumber(try buffer.peek())) {
-        try numberList.append(try buffer.readByte());
-    } else if (try buffer.peek() == TOKEN_PERIOD) {
-        if (config.parserType == ParserType.rfc8259) {
-            debug("Invalid number; RFS8259 doesn't support floating point numbers starting with a decimal point", .{});
-            return error.ParseNumberError;
-        }
 
-        encodingType = NumberEncoding.float;
-        try numberList.append(try buffer.readByte());
-        if (try buffer.getPos() >= try buffer.getEndPos()) {
-            debug("Invalid number; decimal value must follow decimal point", .{});
+            encodingType = NumberEncoding.float;
+            try numberList.append(buffer[pos]);
+            pos += 1;
+            if (pos >= buffer.len) {
+                debug("Invalid number; decimal value must follow decimal point", .{});
+                return error.ParseNumberError;
+            }
+        },
+        else => {
+            debug("Invalid number; invalid starting character, '{c}'", .{buffer[pos]});
             return error.ParseNumberError;
-        }
-    } else {
-        debug("Invalid number; invalid starting character, '{?}'", .{buffer.lastByte()});
-        return error.ParseNumberError;
+        },
     }
 
     // Walk through each character
-    while (try buffer.getPos() < try buffer.getEndPos() and ((encodingType != NumberEncoding.hex and isNumber(try buffer.peek())) or (encodingType == NumberEncoding.hex and isHexDigit(try buffer.peek())))) : (try numberList.append(try buffer.readByte())) {}
+    while (pos < buffer.len and ((encodingType != NumberEncoding.hex and isNumber(buffer[pos])) or (encodingType == NumberEncoding.hex and isHexDigit(buffer[pos])))) {
+        try numberList.append(buffer[pos]);
+        pos += 1;
+    }
 
     // Handle decimal numbers
-    if (try buffer.getPos() < try buffer.getEndPos() and encodingType != NumberEncoding.hex and try buffer.peek() == TOKEN_PERIOD) {
+    if (pos < buffer.len and encodingType != NumberEncoding.hex and buffer[pos] == TOKEN_PERIOD) {
         encodingType = NumberEncoding.float;
-        try numberList.append(try buffer.readByte());
-        while (try buffer.getPos() < try buffer.getEndPos() and isNumber(try buffer.peek())) : (try numberList.append(try buffer.readByte())) {}
+        try numberList.append(buffer[pos]);
+        pos += 1;
+        while (pos < buffer.len and isNumber(buffer[pos])) {
+            try numberList.append(buffer[pos]);
+            pos += 1;
+        }
     }
 
     // Handle exponent
-    if (try buffer.getPos() < try buffer.getEndPos() and encodingType != NumberEncoding.hex and (try buffer.peek() == TOKEN_EXPONENT_LOWER or try buffer.peek() == TOKEN_EXPONENT_UPPER)) {
+    if (pos < buffer.len and encodingType != NumberEncoding.hex and (buffer[pos] == TOKEN_EXPONENT_LOWER or buffer[pos] == TOKEN_EXPONENT_UPPER)) {
         encodingType = NumberEncoding.float;
-        try numberList.append(try buffer.readByte());
-        if (!isNumberOrPlusOrMinus(try buffer.peek())) {
+        try numberList.append(buffer[pos]);
+        pos += 1;
+        if (!isNumberOrPlusOrMinus(buffer[pos])) {
             return error.ParseNumberError;
         }
         // Handle preceeding +/-
-        try numberList.append(try buffer.readByte());
+        try numberList.append(buffer[pos]);
+        pos += 1;
         // Handle the exponent value
-        while (try buffer.getPos() < try buffer.getEndPos() and isNumber(try buffer.peek())) : (try numberList.append(try buffer.readByte())) {}
+        while (pos < buffer.len and isNumber(buffer[pos])) {
+            try numberList.append(buffer[pos]);
+            pos += 1;
+        }
     }
 
-    if (try buffer.getPos() > try buffer.getEndPos()) @panic("Fail");
+    if (pos > buffer.len) @panic("Fail");
 
     var numberString = try allocator.dupe(u8, numberList.items);
     defer allocator.free(numberString);
@@ -788,127 +805,133 @@ fn parseNumber(allocator: Allocator, buffer: *Buffer, config: ParserConfig) Pars
     }
 
     return switch (encodingType) {
-        NumberEncoding.integer => .{ .integer = try std.fmt.parseInt(i64, numberString, 10) },
-        NumberEncoding.float => .{ .float = try std.fmt.parseFloat(f64, numberString) },
+        NumberEncoding.integer => .{ pos, .{ .integer = try std.fmt.parseInt(i64, numberString, 10) } },
+        NumberEncoding.float => .{ pos, .{ .float = try std.fmt.parseFloat(f64, numberString) } },
         // parseInt doesn't support 0x so we have to skip it and manually apply the sign
-        NumberEncoding.hex => .{ .integer = polarity * try std.fmt.parseInt(i64, hexBuffer, 16) },
+        NumberEncoding.hex => .{ pos, .{ .integer = polarity * try std.fmt.parseInt(i64, hexBuffer, 16) } },
         else => return error.ParseNumberError,
     };
 }
 
 // TODO: Drop the JsonValue return
-fn parseEcmaScript51Identifier(allocator: Allocator, buffer: *Buffer) ParseErrors!JsonValue {
+fn parseEcmaScript51Identifier(allocator: Allocator, buffer: []const u8) ParseErrors!struct { usize, JsonValue } {
     var characters = std.ArrayList(u8).init(allocator);
     defer characters.deinit();
-    while (try buffer.getPos() < try buffer.getEndPos() and try isValidEcmaScript51IdentifierCharacter(buffer)) {
-        if (try buffer.peek() == TOKEN_REVERSE_SOLIDUS) {
-            // Unicode escaped character
-            if (try buffer.getEndPos() - try buffer.getPos() < 6) {
-                return error.ParseStringError;
-            }
 
-            var buf: [4]u8 = undefined;
-            try expectOnly(buffer, TOKEN_REVERSE_SOLIDUS);
-            try expectOnly(buffer, 'u');
-            _ = try buffer.read(&buf);
-            const intValue = try std.fmt.parseInt(u21, &buf, 16);
-            buf = undefined;
-            const len = try std.unicode.utf8Encode(intValue, &buf);
-            var i: usize = 0;
-            while (i < len) : (i += 1) {
-                try characters.append(buf[i]);
-            }
-        } else {
-            try characters.append(try buffer.readByte());
+    var pos: usize = 0;
+    while (pos < buffer.len) : (pos += 1) {
+        const c = buffer[pos];
+        if (!isValidEcmaScript51IdentifierCharacter(buffer[pos..])) {
+            debug("Invalid character in EcmaScript51Identifier: '{c}'", .{c});
+            break;
+        }
+
+        switch (c) {
+            TOKEN_REVERSE_SOLIDUS => {
+                // Unicode escaped character
+                if (buffer.len < pos + 6) return error.ParseStringError;
+                if (buffer[pos + 1] != 'u') return error.ParseStringError;
+                pos += 2;
+
+                const intValue = try std.fmt.parseInt(u21, buffer[pos .. pos + 4], 16);
+                var buf: [4]u8 = undefined;
+                const len = try std.unicode.utf8Encode(intValue, &buf);
+                var i: usize = 0;
+                while (i < len) : (i += 1) try characters.append(buf[i]);
+                pos += 3;
+            },
+            else => try characters.append(c),
         }
     }
 
-    if (try buffer.getPos() > try buffer.getEndPos()) return error.ParseStringError;
+    if (pos > buffer.len) return error.ParseStringError;
 
-    return .{ .string = try allocator.dupe(u8, characters.items) };
+    return .{ pos, .{ .string = try allocator.dupe(u8, characters.items) } };
 }
 
 /// Expects the next significant character be token, skipping over all leading and trailing
 /// insignificant whitespace, or returns UnexpectedTokenError.
-fn expect(buffer: *Buffer, config: ParserConfig, token: u8) ParseErrors!void {
-    try skipWhiteSpaces(buffer, config);
-    if (try buffer.peek() != token) {
-        debug("Expected {c} found {c}", .{ token, try buffer.peek() });
+fn expect(buffer: []const u8, config: ParserConfig, token: u8) ParseErrors!usize {
+    var pos = try trimLeftWhitespace(buffer, config);
+    const new_buffer = buffer[pos..];
+    if (new_buffer.len < 1) {
+        debug("Expected {c} found EOF", .{token});
         return error.UnexpectedTokenError;
     }
-    try buffer.skipBytes(1);
-    try skipWhiteSpaces(buffer, config);
-}
-
-/// Expects the next character be token or returns UnexpectedTokenError.
-fn expectOnly(buffer: *Buffer, token: u8) ParseErrors!void {
-    const peek = buffer.peek() catch |err| {
-        if (err == error.OutOfBounds) {
-            debug("Expected {c} found EOF", .{token});
-            return error.UnexpectedTokenError;
-        }
-        return err;
-    };
-    if (peek != token) {
-        debug("Expected {c} found {c}", .{ token, try buffer.peek() });
+    if (new_buffer[0] != token) {
+        debug("Expected {c} found {c}", .{ token, buffer[0] });
         return error.UnexpectedTokenError;
     }
-    try buffer.skipBytes(1);
+    pos += 1;
+    pos += try trimLeftWhitespace(buffer[pos..], config);
+    return pos;
 }
 
 /// Expects the next significant character be token, skipping over all leading insignificant
 /// whitespace, or returns UnexpectedTokenError.
-fn expectUpTo(buffer: *Buffer, config: ParserConfig, token: u8) ParseErrors!void {
-    try skipWhiteSpaces(buffer, config);
-    if (try buffer.peek() != token) {
-        debug("Expected {c} found {c}", .{ token, try buffer.peek() });
+fn expectUpTo(buffer: []const u8, config: ParserConfig, token: u8) ParseErrors!usize {
+    const pos = try trimLeftWhitespace(buffer, config);
+    if (buffer[pos] != token) {
+        debug("Expected {c} found {c}", .{ token, buffer[pos] });
         return error.UnexpectedTokenError;
     }
-    try buffer.skipBytes(1);
+    return pos + 1;
 }
 
 /// Returns the index in the string with the next, significant character
 /// starting from the beginning.
-fn skipWhiteSpaces(buffer: *Buffer, config: ParserConfig) ParseErrors!void {
-    while (true) {
-        // Skip any whitespace
-        while (try buffer.getPos() < try buffer.getEndPos() and isInsignificantWhitespace(try buffer.peek(), config)) : (try buffer.skipBytes(1)) {}
+fn trimLeftWhitespace(buffer: []const u8, config: ParserConfig) ParseErrors!usize {
+    // Skip any whitespace
+    const pos = pos: {
+        for (buffer, 0..) |c, p| if (!isInsignificantWhitespace(c, config)) break :pos p;
+        break :pos buffer.len;
+    };
 
-        // Skip any comments
-        if (config.parserType == ParserType.json5 and try isComment(buffer)) {
-            try skipComment(buffer);
-
-            // If we found comments; we need to ensure we've skipped whitespace again
-            continue;
-        }
-
-        return;
+    // Skip any comments
+    const new_buffer = buffer[pos..];
+    if (config.parserType == ParserType.json5 and isComment(new_buffer)) {
+        const new_pos = try skipComment(new_buffer);
+        return pos + new_pos;
     }
+
+    return pos;
 }
 
 /// Skip over comments
-fn skipComment(buffer: *Buffer) ParseErrors!void {
-    if (!try isComment(buffer)) return;
-
-    var tokens: [2]u8 = undefined;
-    _ = try buffer.read(&tokens);
-    if (tokens[1] == TOKEN_SOLIDUS) {
-        // Single line comment - expect a newline
-        while (try buffer.getPos() < try buffer.getEndPos() and try buffer.peek() != TOKEN_NEW_LINE) : (try buffer.skipBytes(1)) {}
-    } else if (tokens[1] == TOKEN_ASTERISK) {
-        // Multi-line comment
-        while (try buffer.getPos() < try buffer.getEndPos() and (try buffer.peek() != TOKEN_ASTERISK or try buffer.peekNext() != TOKEN_SOLIDUS)) : (try buffer.skipBytes(1)) {}
-        // Skip over the comment lead-out
-        try buffer.skipBytes(2);
-    } else {
-        debug("Invalid comment token", .{});
-        return ParseErrors.ParseCommentError;
+fn skipComment(buffer: []const u8) ParseErrors!usize {
+    if (!isComment(buffer)) return 0;
+    const tokens = buffer[0..2];
+    switch (tokens[1]) {
+        TOKEN_SOLIDUS => {
+            const pos = pos: {
+                for (buffer, 0..) |c, p| if (c == TOKEN_NEW_LINE) break :pos p;
+                break :pos buffer.len;
+            };
+            return pos + 1;
+        },
+        TOKEN_ASTERISK => {
+            const pos = pos: {
+                for (buffer, 0..) |c, p| {
+                    if (p + 1 >= buffer.len) return error.ParseCommentError;
+                    if (c == TOKEN_ASTERISK and buffer[p + 1] == TOKEN_SOLIDUS) break :pos p;
+                }
+                break :pos buffer.len;
+            };
+            if (pos + 2 >= buffer.len) return error.ParseCommentError;
+            return pos + 2;
+        },
+        else => unreachable, // isComment checks for this
     }
 }
 
 /// Returns true if jsonString starts with a comment
-fn isComment(buffer: *Buffer) ParseErrors!bool {
-    return 1 < try buffer.getEndPos() and try buffer.peek() == TOKEN_SOLIDUS and (try buffer.peekNext() == TOKEN_SOLIDUS or try buffer.peekNext() == TOKEN_ASTERISK);
+fn isComment(buffer: []const u8) bool {
+    if (buffer.len < 2) return false;
+    if (buffer[0] != TOKEN_SOLIDUS) return false;
+    switch (buffer[1]) {
+        TOKEN_SOLIDUS, TOKEN_ASTERISK => return true,
+        else => return false,
+    }
 }
 
 /// Returns true if a character matches the RFC8259 grammar specificiation for
@@ -949,52 +972,55 @@ fn isNumber(char: u8) bool {
     return (char >= 48 and char <= 57);
 }
 
-fn isReservedFalse(buffer: *Buffer) ParseErrors!bool {
-    return try buffer.peek() == TOKEN_FALSE[0];
+fn isReservedFalse(buffer: []const u8) bool {
+    if (buffer.len < 5) return false;
+    return buffer[0] == TOKEN_FALSE[0];
 }
 
-fn isReservedInfinity(buffer: *Buffer) ParseErrors!bool {
-    return try buffer.peek() == TOKEN_INFINITY[0];
+fn isReservedInfinity(buffer: []const u8) bool {
+    if (buffer.len < 8) return false;
+    return buffer[0] == TOKEN_INFINITY[0];
 }
 
-fn isReservedNan(buffer: *Buffer) ParseErrors!bool {
-    return try buffer.peek() == TOKEN_NAN[0] and try buffer.peekNext() == TOKEN_NAN[1];
+fn isReservedNan(buffer: []const u8) bool {
+    if (buffer.len < 3) return false;
+    return buffer[0] == TOKEN_NAN[0] and buffer[1] == TOKEN_NAN[1];
 }
 
-fn isReservedNull(buffer: *Buffer) ParseErrors!bool {
-    return try buffer.peek() == TOKEN_NULL[0] and try buffer.peekNext() == TOKEN_NULL[1];
+fn isReservedNull(buffer: []const u8) bool {
+    if (buffer.len < 4) return false;
+    return buffer[0] == TOKEN_NULL[0] and buffer[1] == TOKEN_NULL[1];
 }
 
-fn isReservedTrue(buffer: *Buffer) ParseErrors!bool {
-    return try buffer.peek() == TOKEN_TRUE[0];
+fn isReservedTrue(buffer: []const u8) bool {
+    if (buffer.len < 4) return false;
+    return buffer[0] == TOKEN_TRUE[0];
 }
 
-fn expectWord(buffer: *Buffer, word: []const u8) ParseErrors!void {
-    for (word) |c| {
-        try expectOnly(buffer, c);
-    }
+fn expectWord(buffer: []const u8, word: []const u8) ParseError!usize {
+    if (buffer.len < word.len) return error.ParseValueError;
+    if (!std.mem.eql(u8, buffer[0..word.len], word)) return error.ParseValueError;
+    return word.len;
 }
 
-fn expectNothingNext(buffer: *Buffer, config: ParserConfig) ParseErrors!void {
-    const peek = buffer.peek() catch |err| switch (err) {
-        error.OutOfBounds => return,
-        else => return error.ParseValueError,
-    };
-    if (isInsignificantWhitespace(peek, config)) return;
-    switch (peek) {
+fn expectNothingNext(buffer: []const u8, config: ParserConfig) ParseErrors!void {
+    if (buffer.len == 0) return;
+    if (isInsignificantWhitespace(buffer[0], config)) return;
+    switch (buffer[0]) {
         ',', ']', '}' => {},
         else => return error.ParseValueError,
     }
 }
 
 /// Returns true if jsonString starts with an ECMA Script 5.1 identifier
-fn isStartOfEcmaScript51Identifier(buffer: *Buffer) ParseErrors!bool {
-    const char = try buffer.peek();
+fn isStartOfEcmaScript51Identifier(buffer: []const u8) bool {
+    if (buffer.len == 0) return false;
+    const char = buffer[0];
     // Allowable Identifier starting characters
     if (char == TOKEN_COLON) return false;
     if (isEcmaScript51IdentifierUnicodeCharacter(char) or char == TOKEN_DOLLAR_SIGN or char == TOKEN_UNDERSCORE) return true;
-    if (try buffer.getEndPos() >= 6) {
-        return try buffer.peek() == TOKEN_REVERSE_SOLIDUS and try buffer.peekNext() == 'u';
+    if (buffer.len >= 6) {
+        return buffer[0] == TOKEN_REVERSE_SOLIDUS and buffer[1] == 'u';
     }
 
     return false;
@@ -1006,13 +1032,10 @@ fn isEcmaScript51IdentifierUnicodeCharacter(char: u8) bool {
 }
 
 /// Returns true if the character is an ECMA Script 5.1 identifier character
-fn isValidEcmaScript51IdentifierCharacter(buffer: *Buffer) ParseErrors!bool {
-    const char = try buffer.peek();
-    return char != TOKEN_COLON and (try isStartOfEcmaScript51Identifier(buffer)
-    // TODO: or isUnicodeCombiningSpaceMark(jsonString[0])
-    or isUnicodeDigit(char)
-    // TODO: or isUnicodeConnectorPunctuation(jsonString[0])
-    or char == TOKEN_ZERO_WIDTH_NON_JOINER or char == TOKEN_ZERO_WIDTH_JOINER);
+fn isValidEcmaScript51IdentifierCharacter(buffer: []const u8) bool {
+    const char = buffer[0];
+    if (char == TOKEN_COLON) return false;
+    return isStartOfEcmaScript51Identifier(buffer) or isUnicodeDigit(char) or char == TOKEN_ZERO_WIDTH_NON_JOINER or char == TOKEN_ZERO_WIDTH_JOINER;
 }
 
 /// Returns true if the character is a unicode digit
@@ -1039,11 +1062,14 @@ fn debug(comptime msg: []const u8, args: anytype) void {
 fn expectParseNumberToParseNumber(number: anytype, text: []const u8, config: ParserConfig) !void {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText(text);
-
-    var value = switch (@typeInfo(@TypeOf(number))) {
-        @typeInfo(ParseErrors) => parseNumber(allocator, &buffer, config),
-        else => try parseNumber(allocator, &buffer, config),
+    var value = v: {
+        switch (@typeInfo(@TypeOf(number))) {
+            @typeInfo(ParseErrors) => break :v parseNumber(allocator, text, config),
+            else => {
+                _, const v = try parseNumber(allocator, text, config);
+                break :v v;
+            },
+        }
     };
 
     switch (@typeInfo(@TypeOf(number))) {
@@ -1072,15 +1098,13 @@ fn expectParseNumberToParseNumber(number: anytype, text: []const u8, config: Par
 test "parse can parse a number" {
     const allocator = std.testing.allocator;
 
-    var bufferOne = bufferFromText("0");
-    var root = try parseBuffer(allocator, &bufferOne);
+    var root = try parse(allocator, "0");
     try std.testing.expect(root.value == .integer);
     try std.testing.expectEqual(root.value.asInteger(), 0);
 
     root.deinit();
 
-    var bufferTwo = bufferFromText("0.1");
-    root = try parseBuffer(allocator, &bufferTwo);
+    root = try parse(allocator, "0.1");
     try std.testing.expect(root.value == .float);
     try std.testing.expectEqual(root.value.asFloat(), 0.1);
 
@@ -1090,8 +1114,7 @@ test "parse can parse a number" {
 test "parse can parse a object" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("{\"foo\":\"bar\"}");
-    var root = try parseBuffer(allocator, &buffer);
+    var root = try parse(allocator, "{\"foo\":\"bar\"}");
     defer root.deinit();
     try std.testing.expect(root.value == .object);
 }
@@ -1099,8 +1122,7 @@ test "parse can parse a object" {
 test "parse can parse a array" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("[0,\"foo\",1.337]");
-    var root = try parseBuffer(allocator, &buffer);
+    var root = try parse(allocator, "[0,\"foo\",1.337]");
     defer root.deinit();
     try std.testing.expect(root.value == .array);
     try std.testing.expectEqual(root.value.get(0).asInteger(), 0);
@@ -1111,8 +1133,7 @@ test "parse can parse a array" {
 test "parse can parse an object" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("{\"foo\":\"bar\", \"zig\":\"zabim\"}");
-    var root = try parseBuffer(allocator, &buffer);
+    var root = try parse(allocator, "{\"foo\":\"bar\", \"zig\":\"zabim\"}");
     try std.testing.expect(root.value == .object);
     try std.testing.expect(std.mem.eql(u8, root.value.get("foo").asString(), "bar"));
     const keys = root.value.asObject().keys();
@@ -1128,8 +1149,7 @@ test "parse can parse an object" {
 test "RFC8259.3: parseValue can parse true" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("true");
-    const value = try parseValue(allocator, &buffer, CONFIG_RFC8259);
+    _, const value = try parseValue(allocator, "true", CONFIG_RFC8259);
     try std.testing.expect(value == .boolean);
     try std.testing.expectEqual(value.asBoolean(), true);
 
@@ -1140,8 +1160,7 @@ test "RFC8259.3: parseValue can parse true" {
 test "RFC8259.3: parseValue can parse false" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("false");
-    const value = try parseValue(allocator, &buffer, CONFIG_RFC8259);
+    _, const value = try parseValue(allocator, "false", CONFIG_RFC8259);
     try std.testing.expect(value == .boolean);
     try std.testing.expectEqual(value.asBoolean(), false);
 
@@ -1152,8 +1171,7 @@ test "RFC8259.3: parseValue can parse false" {
 test "RFC8259.3: parseValue can parse null" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("null");
-    const value = try parseValue(allocator, &buffer, CONFIG_RFC8259);
+    _, const value = try parseValue(allocator, "null", CONFIG_RFC8259);
     try std.testing.expect(value == .nil);
     try std.testing.expect(value == .nil);
 
@@ -1164,8 +1182,7 @@ test "RFC8259.3: parseValue can parse null" {
 test "RFC8259.4: parseObject can parse an empty object /1" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("{}");
-    const value = try parseValue(allocator, &buffer, CONFIG_RFC8259);
+    _, const value = try parseValue(allocator, "{}", CONFIG_RFC8259);
     defer value.deinit(allocator);
     try std.testing.expect(value == .object);
     try std.testing.expectEqual(value.len(), 0);
@@ -1174,8 +1191,7 @@ test "RFC8259.4: parseObject can parse an empty object /1" {
 test "RFC8259.4: parseObject can parse an empty object /2" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("{ }");
-    const value = try parseValue(allocator, &buffer, CONFIG_RFC8259);
+    _, const value = try parseValue(allocator, "{ }", CONFIG_RFC8259);
     defer value.deinit(allocator);
     try std.testing.expect(value == .object);
     try std.testing.expectEqual(value.len(), 0);
@@ -1185,8 +1201,7 @@ test "RFC8259.4: parseObject can parse an empty object /3" {
     const allocator = std.testing.allocator;
 
     // Create an empty object with all insignificant whitespace characters
-    var buffer = bufferFromText("\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}{\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}}\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}");
-    const value = try parseValue(allocator, &buffer, CONFIG_RFC8259);
+    _, const value = try parseValue(allocator, "\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}{\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}}\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}", CONFIG_RFC8259);
     defer value.deinit(allocator);
     try std.testing.expect(value == .object);
     try std.testing.expectEqual(value.len(), 0);
@@ -1195,8 +1210,7 @@ test "RFC8259.4: parseObject can parse an empty object /3" {
 test "RFC8259.4: parseObject can parse a simple object /1" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("{\"key1\": \"foo\", \"key2\": \"foo2\", \"key3\": -1, \"key4\": [], \"key5\": { } }");
-    var jsonResult = try parseObject(allocator, &buffer, CONFIG_RFC8259);
+    _, const jsonResult = try parseObject(allocator, "{\"key1\": \"foo\", \"key2\": \"foo2\", \"key3\": -1, \"key4\": [], \"key5\": { } }", CONFIG_RFC8259);
     defer jsonResult.deinit(allocator);
     try std.testing.expect(jsonResult == .object);
 
@@ -1226,8 +1240,7 @@ test "RFC8259.4: parseObject can parse a simple object /2" {
 
     // Same text body as /1 but every inbetween character is the set of insignificant whitepsace
     // characters
-    var buffer = bufferFromText("\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}{\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"key1\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}:\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"foo\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"key2\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}:\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"foo2\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"key3\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}:\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}-1\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"key4\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}:\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}[]\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"key5\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}:\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}{\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}}\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}}\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}");
-    var jsonResult = try parseObject(allocator, &buffer, CONFIG_RFC8259);
+    _, const jsonResult = try parseObject(allocator, "\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}{\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"key1\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}:\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"foo\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"key2\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}:\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"foo2\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"key3\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}:\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}-1\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"key4\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}:\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}[]\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"key5\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}:\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}{\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}}\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}}\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}", CONFIG_RFC8259);
     defer jsonResult.deinit(allocator);
     try std.testing.expect(jsonResult == .object);
 
@@ -1257,8 +1270,7 @@ test "RFC8259.4: parseObject returns UnexpectedTokenException on trailing comma"
 
     // Same text body as /1 but every inbetween character is the set of insignificant whitepsace
     // characters
-    var buffer = bufferFromText("{\"key1\": 1, \"key2\": \"two\", \"key3\": 3.0, \"key4\", {},}");
-    const jsonResult = parseObject(allocator, &buffer, CONFIG_RFC8259);
+    const jsonResult = parseObject(allocator, "{\"key1\": 1, \"key2\": \"two\", \"key3\": 3.0, \"key4\", {},}", CONFIG_RFC8259);
     try std.testing.expectError(error.UnexpectedTokenError, jsonResult);
 }
 
@@ -1267,16 +1279,14 @@ test "RFC8259.4: parseObject returns UnexpectedTokenException on missing comma" 
 
     // Same text body as /1 but every inbetween character is the set of insignificant whitepsace
     // characters
-    var buffer = bufferFromText("{\"key1\": 1, \"key2\": \"two\", \"key3\": 3.0, \"key4\" {}}");
-    const jsonResult = parseObject(allocator, &buffer, CONFIG_RFC8259);
+    const jsonResult = parseObject(allocator, "{\"key1\": 1, \"key2\": \"two\", \"key3\": 3.0, \"key4\" {}}", CONFIG_RFC8259);
     try std.testing.expectError(error.UnexpectedTokenError, jsonResult);
 }
 
 test "RFC8259.5: parseArray can parse an empty array /1" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("[]");
-    var value = try parseArray(allocator, &buffer, CONFIG_RFC8259);
+    _, const value = try parseArray(allocator, "[]", CONFIG_RFC8259);
     defer value.deinit(allocator);
     try std.testing.expect(value == .array);
     try std.testing.expectEqual(value.len(), 0);
@@ -1285,8 +1295,7 @@ test "RFC8259.5: parseArray can parse an empty array /1" {
 test "RFC8259.5: parseArray can parse an empty array /2" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}[\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}]\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}");
-    var value = try parseArray(allocator, &buffer, CONFIG_RFC8259);
+    _, const value = try parseArray(allocator, "\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}[\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}]\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}", CONFIG_RFC8259);
     defer value.deinit(allocator);
     try std.testing.expect(value == .array);
     try std.testing.expectEqual(value.len(), 0);
@@ -1295,8 +1304,7 @@ test "RFC8259.5: parseArray can parse an empty array /2" {
 test "RFC8259.5: parseArray can parse an simple array /3" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("[-1,-1.2,0,1,1.2,\"\",\"foo\",true,false,null,{},{\"foo\":\"bar\", \"baz\": {}}]");
-    var value = try parseArray(allocator, &buffer, CONFIG_RFC8259);
+    _, const value = try parseArray(allocator, "[-1,-1.2,0,1,1.2,\"\",\"foo\",true,false,null,{},{\"foo\":\"bar\", \"baz\": {}}]", CONFIG_RFC8259);
     defer value.deinit(allocator);
     try std.testing.expect(value == .array);
     try std.testing.expectEqual(value.len(), 12);
@@ -1305,8 +1313,7 @@ test "RFC8259.5: parseArray can parse an simple array /3" {
 test "RFC8259.5: parseArray can parse an simple array /4" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}[\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}-1\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}-1.2\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}0\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}1\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}1.2\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"foo\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}true\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}false\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}null\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}{\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}}\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}{\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"foo\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}:\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"bar\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"baz\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}:\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}{\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}}\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}}\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}]\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}");
-    var value = try parseArray(allocator, &buffer, CONFIG_RFC8259);
+    _, const value = try parseArray(allocator, "\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}[\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}-1\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}-1.2\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}0\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}1\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}1.2\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"foo\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}true\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}false\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}null\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}{\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}}\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}{\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"foo\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}:\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"bar\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d},\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"baz\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}:\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}{\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}}\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}}\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}]\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}", CONFIG_RFC8259);
     defer value.deinit(allocator);
     try std.testing.expect(value == .array);
     try std.testing.expectEqual(value.len(), 12);
@@ -1315,16 +1322,14 @@ test "RFC8259.5: parseArray can parse an simple array /4" {
 test "RFC8259.5: parseArray returns UnexpectedTokenError on trailing comma" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("[1,\"two\",3.0,{},]");
-    const value = parseArray(allocator, &buffer, CONFIG_RFC8259);
+    const value = parseArray(allocator, "[1,\"two\",3.0,{},]", CONFIG_RFC8259);
     try std.testing.expectError(error.UnexpectedTokenError, value);
 }
 
 test "RFC8259.6: parseNumber can parse a integer /1" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("0");
-    const value = try parseNumber(allocator, &buffer, CONFIG_RFC8259);
+    _, const value = try parseNumber(allocator, "0", CONFIG_RFC8259);
     try std.testing.expect(value == .integer);
     try std.testing.expectEqual(value.asInteger(), 0);
 }
@@ -1332,8 +1337,7 @@ test "RFC8259.6: parseNumber can parse a integer /1" {
 test "RFC8259.6: parseNumber can parse a integer /2" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("1");
-    const value = try parseNumber(allocator, &buffer, CONFIG_RFC8259);
+    _, const value = try parseNumber(allocator, "1", CONFIG_RFC8259);
     try std.testing.expect(value == .integer);
     try std.testing.expectEqual(value.asInteger(), 1);
 }
@@ -1341,8 +1345,7 @@ test "RFC8259.6: parseNumber can parse a integer /2" {
 test "RFC8259.6: parseNumber can parse a integer /3" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("1337");
-    const value = try parseNumber(allocator, &buffer, CONFIG_RFC8259);
+    _, const value = try parseNumber(allocator, "1337", CONFIG_RFC8259);
     try std.testing.expect(value == .integer);
     try std.testing.expectEqual(value.asInteger(), 1337);
 }
@@ -1350,8 +1353,7 @@ test "RFC8259.6: parseNumber can parse a integer /3" {
 test "RFC8259.6: parseNumber can parse a integer /4" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("-1337");
-    const value = try parseNumber(allocator, &buffer, CONFIG_RFC8259);
+    _, const value = try parseNumber(allocator, "-1337", CONFIG_RFC8259);
     try std.testing.expect(value == .integer);
     try std.testing.expectEqual(value.asInteger(), -1337);
 }
@@ -1359,8 +1361,7 @@ test "RFC8259.6: parseNumber can parse a integer /4" {
 test "RFC8259.6: parseNumber can parse a float /1" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("1.0");
-    const value = try parseNumber(allocator, &buffer, CONFIG_RFC8259);
+    _, const value = try parseNumber(allocator, "1.0", CONFIG_RFC8259);
     try std.testing.expect(value == .float);
     try std.testing.expectEqual(value.asFloat(), 1.0);
 }
@@ -1368,8 +1369,7 @@ test "RFC8259.6: parseNumber can parse a float /1" {
 test "RFC8259.6: parseNumber can parse a float /2" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("-1.0");
-    const value = try parseNumber(allocator, &buffer, CONFIG_RFC8259);
+    _, const value = try parseNumber(allocator, "-1.0", CONFIG_RFC8259);
     try std.testing.expect(value == .float);
     try std.testing.expectEqual(value.asFloat(), -1.0);
 }
@@ -1377,8 +1377,7 @@ test "RFC8259.6: parseNumber can parse a float /2" {
 test "RFC8259.6: parseNumber can parse a float /3" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("1337.0123456789");
-    const value = try parseNumber(allocator, &buffer, CONFIG_RFC8259);
+    _, const value = try parseNumber(allocator, "1337.0123456789", CONFIG_RFC8259);
     try std.testing.expect(value == .float);
     try std.testing.expectEqual(value.asFloat(), 1337.0123456789);
 }
@@ -1386,8 +1385,7 @@ test "RFC8259.6: parseNumber can parse a float /3" {
 test "RFC8259.6: parseNumber can parse a float /4" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("-1337.0123456789");
-    const value = try parseNumber(allocator, &buffer, CONFIG_RFC8259);
+    _, const value = try parseNumber(allocator, "-1337.0123456789", CONFIG_RFC8259);
     try std.testing.expect(value == .float);
     try std.testing.expectEqual(value.asFloat(), -1337.0123456789);
 }
@@ -1395,8 +1393,7 @@ test "RFC8259.6: parseNumber can parse a float /4" {
 test "RFC8259.6: parseNumber can parse an exponent /1" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("13e37");
-    const value = try parseNumber(allocator, &buffer, CONFIG_RFC8259);
+    _, const value = try parseNumber(allocator, "13e37", CONFIG_RFC8259);
     try std.testing.expect(value == .float);
     try std.testing.expectEqual(value.asFloat(), 13e37);
 }
@@ -1404,8 +1401,7 @@ test "RFC8259.6: parseNumber can parse an exponent /1" {
 test "RFC8259.6: parseNumber can parse an exponent /2" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("13E37");
-    const value = try parseNumber(allocator, &buffer, CONFIG_RFC8259);
+    _, const value = try parseNumber(allocator, "13E37", CONFIG_RFC8259);
     try std.testing.expect(value == .float);
     try std.testing.expectEqual(value.asFloat(), 13E37);
 }
@@ -1413,8 +1409,7 @@ test "RFC8259.6: parseNumber can parse an exponent /2" {
 test "RFC8259.6: parseNumber can parse an exponent /3" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("13E+37");
-    const value = try parseNumber(allocator, &buffer, CONFIG_RFC8259);
+    _, const value = try parseNumber(allocator, "13E+37", CONFIG_RFC8259);
     try std.testing.expect(value == .float);
     try std.testing.expectEqual(value.asFloat(), 13E+37);
 }
@@ -1422,8 +1417,7 @@ test "RFC8259.6: parseNumber can parse an exponent /3" {
 test "RFC8259.6: parseNumber can parse an exponent /4" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("13E-37");
-    const value = try parseNumber(allocator, &buffer, CONFIG_RFC8259);
+    _, const value = try parseNumber(allocator, "13E-37", CONFIG_RFC8259);
     try std.testing.expect(value == .float);
     try std.testing.expectEqual(value.asFloat(), 13E-37);
 }
@@ -1431,8 +1425,7 @@ test "RFC8259.6: parseNumber can parse an exponent /4" {
 test "RFC8259.6: parseNumber can parse an exponent /5" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("-13e37");
-    const value = try parseNumber(allocator, &buffer, CONFIG_RFC8259);
+    _, const value = try parseNumber(allocator, "-13e37", CONFIG_RFC8259);
     try std.testing.expect(value == .float);
     try std.testing.expectEqual(value.asFloat(), -13e37);
 }
@@ -1440,8 +1433,7 @@ test "RFC8259.6: parseNumber can parse an exponent /5" {
 test "RFC8259.6: parseNumber can parse an exponent /6" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("-13E37");
-    const value = try parseNumber(allocator, &buffer, CONFIG_RFC8259);
+    _, const value = try parseNumber(allocator, "-13E37", CONFIG_RFC8259);
     try std.testing.expect(value == .float);
     try std.testing.expectEqual(value.asFloat(), -13E37);
 }
@@ -1449,8 +1441,7 @@ test "RFC8259.6: parseNumber can parse an exponent /6" {
 test "RFC8259.6: parseNumber can parse an exponent /7" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("-13E+37");
-    const value = try parseNumber(allocator, &buffer, CONFIG_RFC8259);
+    _, const value = try parseNumber(allocator, "-13E+37", CONFIG_RFC8259);
     try std.testing.expect(value == .float);
     try std.testing.expectEqual(value.asFloat(), -13E+37);
 }
@@ -1458,8 +1449,7 @@ test "RFC8259.6: parseNumber can parse an exponent /7" {
 test "RFC8259.6: parseNumber can parse an exponent /8" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("13E-37");
-    const value = try parseNumber(allocator, &buffer, CONFIG_RFC8259);
+    _, const value = try parseNumber(allocator, "13E-37", CONFIG_RFC8259);
     try std.testing.expect(value == .float);
     try std.testing.expectEqual(value.asFloat(), 13E-37);
 }
@@ -1467,32 +1457,28 @@ test "RFC8259.6: parseNumber can parse an exponent /8" {
 test "RFC8259.6: parseNumber fails on a repeating 0" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("00");
-    const value = parseNumber(allocator, &buffer, CONFIG_RFC8259);
+    const value = parseNumber(allocator, "00", CONFIG_RFC8259);
     try std.testing.expectError(error.ParseNumberError, value);
 }
 
 test "RFC8259.6: parseNumber fails on a non-minus and non-digit start /1" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("a0");
-    const value = parseNumber(allocator, &buffer, CONFIG_RFC8259);
+    const value = parseNumber(allocator, "a0", CONFIG_RFC8259);
     try std.testing.expectError(error.ParseNumberError, value);
 }
 
 test "RFC8259.6: parseNumber fails on a non-minus and non-digit start /2" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("+0");
-    const value = parseNumber(allocator, &buffer, CONFIG_RFC8259);
+    const value = parseNumber(allocator, "+0", CONFIG_RFC8259);
     try std.testing.expectError(error.ParseNumberError, value);
 }
 
 test "RFC8259.6: parseNumber fails on number starting with decimal point" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText(".0");
-    const value = parseNumber(allocator, &buffer, CONFIG_RFC8259);
+    const value = parseNumber(allocator, ".0", CONFIG_RFC8259);
     try std.testing.expectError(error.ParseNumberError, value);
 }
 
@@ -1539,8 +1525,7 @@ test "RFC8259.6 parseNumber fails on single-line comments /1" {
 test "JSON5.7 parseArray ignores multi-line comments /1" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("/* comment */[/* comment */1/* comment */,/* comment */\"two\"/* comment */,/* comment */3.0/* comment */,/* comment */{/* comment */},/* comment */'five'/* comment */,/* comment */{/* comment */six/* comment */:/* comment */0x07/* comment */}/* comment */]/* comment */");
-    var value = try parseArray(allocator, &buffer, CONFIG_JSON5);
+    _, const value = try parseArray(allocator, "/* comment */[/* comment */1/* comment */,/* comment */\"two\"/* comment */,/* comment */3.0/* comment */,/* comment */{/* comment */},/* comment */'five'/* comment */,/* comment */{/* comment */six/* comment */:/* comment */0x07/* comment */}/* comment */]/* comment */", CONFIG_JSON5);
     defer value.deinit(allocator);
     try std.testing.expect(value == .array);
     try std.testing.expectEqual(value.get(0).asInteger(), 1);
@@ -1554,8 +1539,7 @@ test "JSON5.7 parseArray ignores multi-line comments /1" {
 test "JSON5.7 parseArray ignores single-line comments /2" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("// comment \n[// comment \n1// comment \n,// comment \n\"two\"// comment \n,// comment \n3.0// comment \n,// comment \n{// comment \n},// comment \n'five'// comment \n,// comment \n{// comment \nsix// comment \n:// comment \n0x07// comment \n}// comment \n]// comment \n");
-    var value = try parseArray(allocator, &buffer, CONFIG_JSON5);
+    _, const value = try parseArray(allocator, "// comment \n[// comment \n1// comment \n,// comment \n\"two\"// comment \n,// comment \n3.0// comment \n,// comment \n{// comment \n},// comment \n'five'// comment \n,// comment \n{// comment \nsix// comment \n:// comment \n0x07// comment \n}// comment \n]// comment \n", CONFIG_JSON5);
     defer value.deinit(allocator);
     try std.testing.expect(value == .array);
     try std.testing.expectEqual(value.get(0).asInteger(), 1);
@@ -1569,8 +1553,7 @@ test "JSON5.7 parseArray ignores single-line comments /2" {
 test "JSON5.7: parseObject ignores multi-line comments /1" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("/* comment */{/* comment */key1/* comment */:/* comment */\"foo\"/* comment */,/* comment */ȡkey2/* comment */:/* comment */\"foo2\"/* comment */,/* comment */\u{0221}key3/* comment */:/* comment */-1/* comment */,/* comment */'key4'/* comment */:/* comment */[/* comment */]/* comment */,/* comment */\"key5\"/* comment */:/* comment */{/* comment */}/* comment */,/* comment */}/* comment */");
-    var jsonResult = try parseObject(allocator, &buffer, CONFIG_JSON5);
+    _, const jsonResult = try parseObject(allocator, "/* comment */{/* comment */key1/* comment */:/* comment */\"foo\"/* comment */,/* comment */ȡkey2/* comment */:/* comment */\"foo2\"/* comment */,/* comment */\u{0221}key3/* comment */:/* comment */-1/* comment */,/* comment */'key4'/* comment */:/* comment */[/* comment */]/* comment */,/* comment */\"key5\"/* comment */:/* comment */{/* comment */}/* comment */,/* comment */}/* comment */", CONFIG_JSON5);
     defer jsonResult.deinit(allocator);
     try std.testing.expect(jsonResult == .object);
 
@@ -1598,8 +1581,7 @@ test "JSON5.7: parseObject ignores multi-line comments /1" {
 test "JSON5.7: parseObject ignores single-line comments /2" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("// comment \n{// comment \nkey1// comment \n:// comment \n\"foo\"// comment \n,// comment \nȡkey2// comment \n:// comment \n\"foo2\"// comment \n,// comment \n\u{0221}key3// comment \n:// comment \n-1// comment \n,// comment \n'key4'// comment \n:// comment \n[// comment \n]// comment \n,// comment \n\"key5\"// comment \n:// comment \n{// comment \n}// comment \n,// comment \n}// comment \n");
-    var jsonResult = try parseObject(allocator, &buffer, CONFIG_JSON5);
+    _, const jsonResult = try parseObject(allocator, "// comment \n{// comment \nkey1// comment \n:// comment \n\"foo\"// comment \n,// comment \nȡkey2// comment \n:// comment \n\"foo2\"// comment \n,// comment \n\u{0221}key3// comment \n:// comment \n-1// comment \n,// comment \n'key4'// comment \n:// comment \n[// comment \n]// comment \n,// comment \n\"key5\"// comment \n:// comment \n{// comment \n}// comment \n,// comment \n}// comment \n", CONFIG_JSON5);
     defer jsonResult.deinit(allocator);
     try std.testing.expect(jsonResult == .object);
 
@@ -1627,8 +1609,7 @@ test "JSON5.7: parseObject ignores single-line comments /2" {
 test "RFC8259.7: parseStringWithTerminal can parse an empty string /1" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("\"\"");
-    var value = try parseStringWithTerminal(allocator, &buffer, CONFIG_RFC8259, TOKEN_DOUBLE_QUOTE);
+    _, const value = try parseStringWithTerminal(allocator, "\"\"", CONFIG_RFC8259, TOKEN_DOUBLE_QUOTE);
     defer value.deinit(allocator);
     try std.testing.expect(value == .string);
     try std.testing.expect(std.mem.eql(u8, value.asString(), ""));
@@ -1637,8 +1618,7 @@ test "RFC8259.7: parseStringWithTerminal can parse an empty string /1" {
 test "RFC8259.7: parseStringWithTerminal can parse an empty string /2" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}");
-    var value = try parseStringWithTerminal(allocator, &buffer, CONFIG_RFC8259, TOKEN_DOUBLE_QUOTE);
+    _, const value = try parseStringWithTerminal(allocator, "\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}\"\"\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}", CONFIG_RFC8259, TOKEN_DOUBLE_QUOTE);
     defer value.deinit(allocator);
     try std.testing.expect(value == .string);
     try std.testing.expect(std.mem.eql(u8, value.asString(), ""));
@@ -1647,8 +1627,7 @@ test "RFC8259.7: parseStringWithTerminal can parse an empty string /2" {
 test "RFC8259.7: parseStringWithTerminal can parse a simple string /1" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("\"some string\"");
-    var value = try parseStringWithTerminal(allocator, &buffer, CONFIG_RFC8259, TOKEN_DOUBLE_QUOTE);
+    _, const value = try parseStringWithTerminal(allocator, "\"some string\"", CONFIG_RFC8259, TOKEN_DOUBLE_QUOTE);
     defer value.deinit(allocator);
     try std.testing.expect(value == .string);
     try std.testing.expect(std.mem.eql(u8, value.asString(), "some string"));
@@ -1657,8 +1636,7 @@ test "RFC8259.7: parseStringWithTerminal can parse a simple string /1" {
 test "RFC8259.7: parseStringWithTerminal can parse a simple string /2" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("\"some\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}string\"");
-    var value = try parseStringWithTerminal(allocator, &buffer, CONFIG_RFC8259, TOKEN_DOUBLE_QUOTE);
+    _, const value = try parseStringWithTerminal(allocator, "\"some\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}string\"", CONFIG_RFC8259, TOKEN_DOUBLE_QUOTE);
     defer value.deinit(allocator);
     try std.testing.expect(value == .string);
     try std.testing.expect(std.mem.eql(u8, value.asString(), "some\u{20}\u{09}\u{0A}\u{0a}\u{0D}\u{0d}string"));
@@ -1668,8 +1646,7 @@ test "RFC8259.7: parseStringWithTerminal can parse a simple string /3" {
     const allocator = std.testing.allocator;
 
     // some\"string
-    var buffer = bufferFromText("\"some\\\"string\"");
-    var value = try parseStringWithTerminal(allocator, &buffer, CONFIG_RFC8259, TOKEN_DOUBLE_QUOTE);
+    _, const value = try parseStringWithTerminal(allocator, "\"some\\\"string\"", CONFIG_RFC8259, TOKEN_DOUBLE_QUOTE);
     defer value.deinit(allocator);
     try std.testing.expect(value == .string);
     try std.testing.expect(std.mem.eql(u8, value.asString(), "some\"string"));
@@ -1679,8 +1656,7 @@ test "RFC8259.7: parseStringWithTerminal can parse a simple string /4" {
     const allocator = std.testing.allocator;
 
     // some\\"string
-    var buffer = bufferFromText("\"some\\\\\\\"string\"");
-    var value = try parseStringWithTerminal(allocator, &buffer, CONFIG_RFC8259, TOKEN_DOUBLE_QUOTE);
+    _, const value = try parseStringWithTerminal(allocator, "\"some\\\\\\\"string\"", CONFIG_RFC8259, TOKEN_DOUBLE_QUOTE);
     defer value.deinit(allocator);
     try std.testing.expect(value == .string);
     try std.testing.expect(std.mem.eql(u8, value.asString(), "some\\\"string"));
@@ -1690,8 +1666,7 @@ test "RFC8259.7: parseStringWithTerminal can parse a simple string /5" {
     const allocator = std.testing.allocator;
 
     // ",\,\u{00-0f}
-    var buffer = bufferFromText("\"\\\"\\\\\u{00}\u{01}\u{02}\u{03}\u{04}\u{05}\u{06}\u{07}\u{08}\u{09}\u{0A}\u{0B}\u{0C}\u{0D}\u{0E}\u{0F}\u{10}\u{11}\u{12}\u{13}\u{14}\u{15}\u{16}\u{17}\u{18}\u{19}\u{1A}\u{1B}\u{1C}\u{1D}\u{1E}\u{1F}\"");
-    var value = try parseStringWithTerminal(allocator, &buffer, CONFIG_RFC8259, TOKEN_DOUBLE_QUOTE);
+    _, const value = try parseStringWithTerminal(allocator, "\"\\\"\\\\\u{00}\u{01}\u{02}\u{03}\u{04}\u{05}\u{06}\u{07}\u{08}\u{09}\u{0A}\u{0B}\u{0C}\u{0D}\u{0E}\u{0F}\u{10}\u{11}\u{12}\u{13}\u{14}\u{15}\u{16}\u{17}\u{18}\u{19}\u{1A}\u{1B}\u{1C}\u{1D}\u{1E}\u{1F}\"", CONFIG_RFC8259, TOKEN_DOUBLE_QUOTE);
     defer value.deinit(allocator);
     try std.testing.expect(value == .string);
     try std.testing.expect(std.mem.eql(u8, value.asString(), "\"\\\u{00}\u{01}\u{02}\u{03}\u{04}\u{05}\u{06}\u{07}\u{08}\u{09}\u{0A}\u{0B}\u{0C}\u{0D}\u{0E}\u{0F}\u{10}\u{11}\u{12}\u{13}\u{14}\u{15}\u{16}\u{17}\u{18}\u{19}\u{1A}\u{1B}\u{1C}\u{1D}\u{1E}\u{1F}"));
@@ -1701,8 +1676,7 @@ test "RFC8259.8.3: parseStringWithTerminal parsing results in equivalent strings
     const allocator = std.testing.allocator;
 
     // Test that \\ equals \u{5C}
-    var buffer = bufferFromText("\"a\\\\b\"");
-    var value = try parseStringWithTerminal(allocator, &buffer, CONFIG_RFC8259, TOKEN_DOUBLE_QUOTE);
+    _, const value = try parseStringWithTerminal(allocator, "\"a\\\\b\"", CONFIG_RFC8259, TOKEN_DOUBLE_QUOTE);
     defer value.deinit(allocator);
     try std.testing.expect(value == .string);
     try std.testing.expect(std.mem.eql(u8, value.asString(), "a\u{5C}b"));
@@ -1711,8 +1685,7 @@ test "RFC8259.8.3: parseStringWithTerminal parsing results in equivalent strings
 test "JSON5; parseEcmaScript51Identifier can parse simple identifier /1" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("someIdentifier");
-    var value = try parseEcmaScript51Identifier(allocator, &buffer);
+    _, const value = try parseEcmaScript51Identifier(allocator, "someIdentifier");
     defer value.deinit(allocator);
     try std.testing.expect(value == .string);
     try std.testing.expect(std.mem.eql(u8, value.asString(), "someIdentifier"));
@@ -1721,8 +1694,7 @@ test "JSON5; parseEcmaScript51Identifier can parse simple identifier /1" {
 test "JSON5; parseEcmaScript51Identifier can parse simple identifier /2" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("_someIdentifier");
-    var value = try parseEcmaScript51Identifier(allocator, &buffer);
+    _, const value = try parseEcmaScript51Identifier(allocator, "_someIdentifier");
     defer value.deinit(allocator);
     try std.testing.expect(value == .string);
     try std.testing.expect(std.mem.eql(u8, value.asString(), "_someIdentifier"));
@@ -1731,8 +1703,7 @@ test "JSON5; parseEcmaScript51Identifier can parse simple identifier /2" {
 test "JSON5; parseEcmaScript51Identifier can parse simple identifier /3" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("$someIdentifier");
-    var value = try parseEcmaScript51Identifier(allocator, &buffer);
+    _, const value = try parseEcmaScript51Identifier(allocator, "$someIdentifier");
     defer value.deinit(allocator);
     try std.testing.expect(value == .string);
     try std.testing.expect(std.mem.eql(u8, value.asString(), "$someIdentifier"));
@@ -1741,8 +1712,7 @@ test "JSON5; parseEcmaScript51Identifier can parse simple identifier /3" {
 test "JSON5.3; parseEcmaScript51Identifier can parse simple identifier /2" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("\\u005FsomeIdentifier");
-    var value = try parseEcmaScript51Identifier(allocator, &buffer);
+    _, const value = try parseEcmaScript51Identifier(allocator, "\\u005FsomeIdentifier");
     defer value.deinit(allocator);
     try std.testing.expect(value == .string);
     try std.testing.expect(std.mem.eql(u8, value.asString(), "\u{005f}someIdentifier"));
@@ -1751,8 +1721,7 @@ test "JSON5.3; parseEcmaScript51Identifier can parse simple identifier /2" {
 test "JSON5.3: parseObject can parse a simple object /1" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("{key1: \"foo\", ȡkey2: \"foo2\", \u{0221}key3 : -1, 'key4': [], \"key5\": { } }");
-    var jsonResult = try parseObject(allocator, &buffer, CONFIG_JSON5);
+    _, const jsonResult = try parseObject(allocator, "{key1: \"foo\", ȡkey2: \"foo2\", \u{0221}key3 : -1, 'key4': [], \"key5\": { } }", CONFIG_JSON5);
     defer jsonResult.deinit(allocator);
     try std.testing.expect(jsonResult == .object);
 
@@ -1780,8 +1749,7 @@ test "JSON5.3: parseObject can parse a simple object /1" {
 test "JSON5.3: parseObject can parse a simple object with trailing comma" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("{key1: \"foo\", ȡkey2: \"foo2\", \u{0221}key3 : -1, 'key4': [], \"key5\": { }, }");
-    var jsonResult = try parseObject(allocator, &buffer, CONFIG_JSON5);
+    _, const jsonResult = try parseObject(allocator, "{key1: \"foo\", ȡkey2: \"foo2\", \u{0221}key3 : -1, 'key4': [], \"key5\": { }, }", CONFIG_JSON5);
     defer jsonResult.deinit(allocator);
     try std.testing.expect(jsonResult == .object);
 
@@ -1809,8 +1777,7 @@ test "JSON5.3: parseObject can parse a simple object with trailing comma" {
 test "JSON5.4 parseArray can parse a simple array /1" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("[1, \"two\", 3.0, {}, 'five', {six: 0x07}]");
-    var value = try parseArray(allocator, &buffer, CONFIG_JSON5);
+    _, const value = try parseArray(allocator, "[1, \"two\", 3.0, {}, 'five', {six: 0x07}]", CONFIG_JSON5);
     defer value.deinit(allocator);
     try std.testing.expect(value == .array);
     try std.testing.expectEqual(value.get(0).asInteger(), 1);
@@ -1878,18 +1845,15 @@ test "JSON5.4 parseNumber can parse a float" {
 test "JSON5.6 parseNumber can parse nan" {
     const allocator = std.testing.allocator;
 
-    var buffer1 = bufferFromText("NaN");
-    var value = try parseNumber(allocator, &buffer1, CONFIG_JSON5);
+    _, var value = try parseNumber(allocator, "NaN", CONFIG_JSON5);
     try std.testing.expect(value == .float);
     try std.testing.expect(std.math.isNan(value.asFloat()));
 
-    var buffer2 = bufferFromText("+NaN");
-    value = try parseNumber(allocator, &buffer2, CONFIG_JSON5);
+    _, value = try parseNumber(allocator, "+NaN", CONFIG_JSON5);
     try std.testing.expect(value == .float);
     try std.testing.expect(std.math.isNan(value.asFloat()));
 
-    var buffer3 = bufferFromText("-NaN");
-    value = try parseNumber(allocator, &buffer3, CONFIG_JSON5);
+    _, value = try parseNumber(allocator, "-NaN", CONFIG_JSON5);
     try std.testing.expect(value == .float);
     try std.testing.expect(std.math.isNan(value.asFloat()));
 }
@@ -1897,8 +1861,7 @@ test "JSON5.6 parseNumber can parse nan" {
 test "JSON5.7 parseArray ignores multi-line comments" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("/* comment */[/* comment */1/* comment */,/* comment */\"two\"/* comment */,/* comment */3.0/* comment */,/* comment */{/* comment */},/* comment */'five'/* comment */,/* comment */{/* comment */six/* comment */:/* comment */0x07/* comment */}/* comment */]/* comment */");
-    var value = try parseArray(allocator, &buffer, CONFIG_JSON5);
+    _, const value = try parseArray(allocator, "/* comment */[/* comment */1/* comment */,/* comment */\"two\"/* comment */,/* comment */3.0/* comment */,/* comment */{/* comment */},/* comment */'five'/* comment */,/* comment */{/* comment */six/* comment */:/* comment */0x07/* comment */}/* comment */]/* comment */", CONFIG_JSON5);
     defer value.deinit(allocator);
     try std.testing.expect(value == .array);
     try std.testing.expectEqual(value.get(0).asInteger(), 1);
@@ -1912,8 +1875,7 @@ test "JSON5.7 parseArray ignores multi-line comments" {
 test "JSON5.7 parseArray ignores single-line comments" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("// comment \n[// comment \n1// comment \n,// comment \n\"two\"// comment \n,// comment \n3.0// comment \n,// comment \n{// comment \n},// comment \n'five'// comment \n,// comment \n{// comment \nsix// comment \n:// comment \n0x07// comment \n}// comment \n]// comment \n");
-    var value = try parseArray(allocator, &buffer, CONFIG_JSON5);
+    _, const value = try parseArray(allocator, "// comment \n[// comment \n1// comment \n,// comment \n\"two\"// comment \n,// comment \n3.0// comment \n,// comment \n{// comment \n},// comment \n'five'// comment \n,// comment \n{// comment \nsix// comment \n:// comment \n0x07// comment \n}// comment \n]// comment \n", CONFIG_JSON5);
     defer value.deinit(allocator);
     try std.testing.expect(value == .array);
     try std.testing.expectEqual(value.get(0).asInteger(), 1);
@@ -1927,8 +1889,7 @@ test "JSON5.7 parseArray ignores single-line comments" {
 test "JSON5.7: parseObject ignores multi-line comments" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("/* comment */{/* comment */key1/* comment */:/* comment */\"foo\"/* comment */,/* comment */ȡkey2/* comment */:/* comment */\"foo2\"/* comment */,/* comment */\u{0221}key3/* comment */:/* comment */-1/* comment */,/* comment */'key4'/* comment */:/* comment */[/* comment */]/* comment */,/* comment */\"key5\"/* comment */:/* comment */{/* comment */}/* comment */,/* comment */}/* comment */");
-    var jsonResult = try parseObject(allocator, &buffer, CONFIG_JSON5);
+    _, const jsonResult = try parseObject(allocator, "/* comment */{/* comment */key1/* comment */:/* comment */\"foo\"/* comment */,/* comment */ȡkey2/* comment */:/* comment */\"foo2\"/* comment */,/* comment */\u{0221}key3/* comment */:/* comment */-1/* comment */,/* comment */'key4'/* comment */:/* comment */[/* comment */]/* comment */,/* comment */\"key5\"/* comment */:/* comment */{/* comment */}/* comment */,/* comment */}/* comment */", CONFIG_JSON5);
     defer jsonResult.deinit(allocator);
     try std.testing.expect(jsonResult == .object);
 
@@ -1956,8 +1917,7 @@ test "JSON5.7: parseObject ignores multi-line comments" {
 test "JSON5.7: parseObject ignores single-line comments" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText("// comment \n{// comment \nkey1// comment \n:// comment \n\"foo\"// comment \n,// comment \nȡkey2// comment \n:// comment \n\"foo2\"// comment \n,// comment \n\u{0221}key3// comment \n:// comment \n-1// comment \n,// comment \n'key4'// comment \n:// comment \n[// comment \n]// comment \n,// comment \n\"key5\"// comment \n:// comment \n{// comment \n}// comment \n,// comment \n}// comment \n");
-    var jsonResult = try parseObject(allocator, &buffer, CONFIG_JSON5);
+    _, const jsonResult = try parseObject(allocator, "// comment \n{// comment \nkey1// comment \n:// comment \n\"foo\"// comment \n,// comment \nȡkey2// comment \n:// comment \n\"foo2\"// comment \n,// comment \n\u{0221}key3// comment \n:// comment \n-1// comment \n,// comment \n'key4'// comment \n:// comment \n[// comment \n]// comment \n,// comment \n\"key5\"// comment \n:// comment \n{// comment \n}// comment \n,// comment \n}// comment \n", CONFIG_JSON5);
     defer jsonResult.deinit(allocator);
     try std.testing.expect(jsonResult == .object);
 
@@ -2019,7 +1979,7 @@ test "JSON5.4 parseNumber ignores single-line comments" {
 test "README.md simple test" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText(
+    const buffer =
         \\{
         \\  "foo": [
         \\    null,
@@ -2031,8 +1991,8 @@ test "README.md simple test" {
         \\    }
         \\  ]
         \\}
-    );
-    var root = try parseBuffer(allocator, &buffer);
+    ;
+    var root = try parse(allocator, buffer);
     const bazObj = root.value.get("foo").get(4);
 
     try bazObj.serialize(std.io.getStdErr().writer(), .SPACES_2, 0);
@@ -2045,7 +2005,7 @@ test "README.md simple test" {
 test "README.md simple test json5" {
     const allocator = std.testing.allocator;
 
-    var buffer = bufferFromText(
+    const buffer =
         \\{
         \\  foo: [
         \\    /* Some
@@ -2062,8 +2022,8 @@ test "README.md simple test json5" {
         \\    },
         \\  ],
         \\}
-    );
-    var root = try parseJson5Buffer(allocator, &buffer);
+    ;
+    var root = try parseJson5(allocator, buffer);
     const bazObj = root.value.get("foo").get(4);
 
     try bazObj.serialize(std.io.getStdErr().writer(), .SPACES_2, 0);
@@ -2073,10 +2033,11 @@ test "README.md simple test json5" {
     defer root.deinit();
 }
 
+// TODO: For stream implementation
 test "README.md simple test with stream source" {
     const allocator = std.testing.allocator;
 
-    var source = std.io.StreamSource{ .const_buffer = std.io.fixedBufferStream(
+    const source = 
         \\{
         \\  foo: [
         \\    /* Some
@@ -2093,9 +2054,8 @@ test "README.md simple test with stream source" {
         \\    },
         \\  ],
         \\}
-    ) };
-    var buffer = bufferFromStreamSource(&source);
-    var root = try parseJson5Buffer(allocator, &buffer);
+    ;
+    var root = try parseJson5(allocator, source);
     defer root.deinit();
 
     const bazObj = root.value.get("foo").get(4);
@@ -2109,24 +2069,20 @@ test "Underread Literal" {
     const allocator = std.testing.allocator;
 
     {
-        var buffer = bufferFromText("tru");
-        const value = parseValue(allocator, &buffer, CONFIG_RFC8259);
-        try std.testing.expectEqual(error.UnexpectedTokenError, value);
+        const value = parseValue(allocator, "tru", CONFIG_RFC8259);
+        try std.testing.expectEqual(error.ParseValueError, value);
     }
     {
-        var buffer = bufferFromText("t");
-        const value = parseValue(allocator, &buffer, CONFIG_RFC8259);
-        try std.testing.expectEqual(error.UnexpectedTokenError, value);
+        const value = parseValue(allocator, "t", CONFIG_RFC8259);
+        try std.testing.expectEqual(error.ParseValueError, value);
     }
     {
-        var buffer = bufferFromText("fals");
-        const value = parseValue(allocator, &buffer, CONFIG_RFC8259);
-        try std.testing.expectEqual(error.UnexpectedTokenError, value);
+        const value = parseValue(allocator, "fals", CONFIG_RFC8259);
+        try std.testing.expectEqual(error.ParseValueError, value);
     }
     {
-        var buffer = bufferFromText("f");
-        const value = parseValue(allocator, &buffer, CONFIG_RFC8259);
-        try std.testing.expectEqual(error.UnexpectedTokenError, value);
+        const value = parseValue(allocator, "f", CONFIG_RFC8259);
+        try std.testing.expectEqual(error.ParseValueError, value);
     }
 }
 
@@ -2134,33 +2090,27 @@ test "Match Literal" {
     const allocator = std.testing.allocator;
 
     {
-        var buffer = bufferFromText("truee");
-        const value = parseValue(allocator, &buffer, CONFIG_RFC8259);
+        const value = parseValue(allocator, "truee", CONFIG_RFC8259);
         try std.testing.expectEqual(error.ParseValueError, value);
     }
     {
-        var buffer = bufferFromText("truex");
-        const value = parseValue(allocator, &buffer, CONFIG_RFC8259);
+        const value = parseValue(allocator, "truex", CONFIG_RFC8259);
         try std.testing.expectEqual(error.ParseValueError, value);
     }
     {
-        var buffer = bufferFromText("falsee");
-        const value = parseValue(allocator, &buffer, CONFIG_RFC8259);
+        const value = parseValue(allocator, "falsee", CONFIG_RFC8259);
         try std.testing.expectEqual(error.ParseValueError, value);
     }
     {
-        var buffer = bufferFromText("falsex");
-        const value = parseValue(allocator, &buffer, CONFIG_RFC8259);
+        const value = parseValue(allocator, "falsex", CONFIG_RFC8259);
         try std.testing.expectEqual(error.ParseValueError, value);
     }
     {
-        var buffer = bufferFromText("nulll");
-        const value = parseValue(allocator, &buffer, CONFIG_RFC8259);
+        const value = parseValue(allocator, "nulll", CONFIG_RFC8259);
         try std.testing.expectEqual(error.ParseValueError, value);
     }
     {
-        var buffer = bufferFromText("nullx");
-        const value = parseValue(allocator, &buffer, CONFIG_RFC8259);
+        const value = parseValue(allocator, "nullx", CONFIG_RFC8259);
         try std.testing.expectEqual(error.ParseValueError, value);
     }
 }
@@ -2169,24 +2119,21 @@ test "Escaped Strings" {
     const allocator = std.testing.allocator;
 
     {
-        var buffer = bufferFromText("\"\\u0020\"");
-        var value = try parseStringWithTerminal(allocator, &buffer, CONFIG_RFC8259, TOKEN_DOUBLE_QUOTE);
+        _, const value = try parseStringWithTerminal(allocator, "\"\\u0020\"", CONFIG_RFC8259, TOKEN_DOUBLE_QUOTE);
         defer value.deinit(allocator);
         try std.testing.expect(value == .string);
         try std.testing.expectEqualStrings(" ", value.asString());
     }
 
     {
-        var buffer = bufferFromText("\"\\u0009\"");
-        var value = try parseStringWithTerminal(allocator, &buffer, CONFIG_RFC8259, TOKEN_DOUBLE_QUOTE);
+        _, const value = try parseStringWithTerminal(allocator, "\"\\u0009\"", CONFIG_RFC8259, TOKEN_DOUBLE_QUOTE);
         defer value.deinit(allocator);
         try std.testing.expect(value == .string);
         try std.testing.expectEqualStrings(&[_]u8{9}, value.asString());
     }
 
     {
-        var buffer = bufferFromText("\"\\b\\b\\b\"");
-        var value = try parseStringWithTerminal(allocator, &buffer, CONFIG_RFC8259, TOKEN_DOUBLE_QUOTE);
+        _, const value = try parseStringWithTerminal(allocator, "\"\\b\\b\\b\"", CONFIG_RFC8259, TOKEN_DOUBLE_QUOTE);
         defer value.deinit(allocator);
         try std.testing.expect(value == .string);
         try std.testing.expectEqualStrings(&[_]u8{ 8, 8, 8 }, value.asString());
