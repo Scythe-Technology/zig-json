@@ -429,7 +429,7 @@ pub fn parseJson5(allocator: Allocator, jsonString: []const u8) !JsonRoot {
 
 /// Parse a JSON value from the provided slice
 /// Returns the index of the next character to read
-fn parseValue(allocator: Allocator, buffer: []const u8, config: ParserConfig) ParseErrors!struct { usize, JsonValue } {
+fn parseValue(allocator: Allocator, buffer: []const u8, comptime config: ParserConfig) ParseErrors!struct { usize, JsonValue } {
     if (buffer.len == 0) return error.ParseValueError;
     var pos: usize = try trimLeftWhitespace(buffer, config);
     const char = buffer[pos];
@@ -453,45 +453,48 @@ fn parseValue(allocator: Allocator, buffer: []const u8, config: ParserConfig) Pa
                 pos += read_pos;
                 break :result result;
             },
-            else => {},
-        }
-        // ' indicates a string (json5)
-        if (config.parserType == ParserType.json5 and char == TOKEN_SINGLE_QUOTE) {
-            const read_pos, const result = try parseStringWithTerminal(allocator, buffer[pos..], config, TOKEN_SINGLE_QUOTE);
-            pos += read_pos;
-            break :result result;
-        }
+            // 0-9|- indicates a number
+            TOKEN_INFINITY[0], TOKEN_NAN[0], '-', '+', 48...57 => {
+                const read_pos, const result = try parseNumber(allocator, buffer[pos..], config);
+                pos += read_pos;
+                break :result result;
+            },
+            // t indicates true
+            TOKEN_TRUE[0] => {
+                if (buffer.len < 4) return error.ParseValueError;
+                pos += try expectWord(buffer[pos..], TOKEN_TRUE);
+                try expectNothingNext(buffer[pos..], config);
+                break :result JSON_TRUE;
+            },
+            // f indicates false
+            TOKEN_FALSE[0] => {
+                if (buffer.len < 5) return error.ParseValueError;
+                pos += try expectWord(buffer[pos..], TOKEN_FALSE);
+                try expectNothingNext(buffer[pos..], config);
+                break :result JSON_FALSE;
+            },
+            // n indicates null
+            TOKEN_NULL[0] => {
+                if (buffer.len < 4) return error.ParseValueError;
+                pos += try expectWord(buffer[pos..], TOKEN_NULL);
+                try expectNothingNext(buffer[pos..], config);
+                break :result JSON_NULL;
+            },
+            // ' indicates a string (json5)
+            TOKEN_SINGLE_QUOTE => {
+                if (config.parserType != ParserType.json5) return error.ParseValueError;
+                const read_pos, const result = try parseStringWithTerminal(allocator, buffer[pos..], config, TOKEN_SINGLE_QUOTE);
+                pos += read_pos;
+                break :result result;
+            },
+            else => {
+                var remaining = buffer[pos..];
+                if (remaining.len > 16) remaining = remaining[0..16];
+                debug("Unable to parse value from \"{s}...\"", .{remaining});
 
-        // 0-9|- indicates a number
-        if (isReservedInfinity(buffer[pos..]) or isReservedNan(buffer[pos..]) or isNumberOrPlusOrMinus(char)) {
-            const read_pos, const result = try parseNumber(allocator, buffer[pos..], config);
-            pos += read_pos;
-            break :result result;
+                return error.ParseValueError;
+            },
         }
-
-        if (isReservedTrue(buffer[pos..])) {
-            pos += try expectWord(buffer[pos..], TOKEN_TRUE);
-            try expectNothingNext(buffer[pos..], config);
-            break :result JSON_TRUE;
-        }
-
-        if (isReservedFalse(buffer[pos..])) {
-            pos += try expectWord(buffer[pos..], TOKEN_FALSE);
-            try expectNothingNext(buffer[pos..], config);
-            break :result JSON_FALSE;
-        }
-
-        if (isReservedNull(buffer[pos..])) {
-            pos += try expectWord(buffer[pos..], TOKEN_NULL);
-            try expectNothingNext(buffer[pos..], config);
-            break :result JSON_NULL;
-        }
-
-        var remaining = buffer[pos..];
-        if (remaining.len > 16) remaining = remaining[0..16];
-        debug("Unable to parse value from \"{s}...\"", .{remaining});
-
-        return error.ParseValueError;
     };
 
     return .{ pos, result };
@@ -501,7 +504,7 @@ fn parseValue(allocator: Allocator, buffer: []const u8, config: ParserConfig) Pa
 /// Returns the index of the next character to read
 /// Note: parseObject _assumes_ the leading { has been stripped and jsonString
 ///  starts after that point.
-fn parseObject(allocator: Allocator, buffer: []const u8, config: ParserConfig) ParseErrors!struct { usize, JsonValue } {
+fn parseObject(allocator: Allocator, buffer: []const u8, comptime config: ParserConfig) ParseErrors!struct { usize, JsonValue } {
     const ptr = try allocator.create(std.StringArrayHashMap(JsonValue));
     ptr.* = std.StringArrayHashMap(JsonValue).init(allocator);
     const jsonValue = JsonValue{ .object = ptr };
@@ -581,7 +584,7 @@ fn parseObject(allocator: Allocator, buffer: []const u8, config: ParserConfig) P
 /// Returns the index of the next character to read
 /// Note: parseArray _assumes_ the leading [ has been stripped and jsonString
 ///  starts after that point.
-fn parseArray(allocator: Allocator, buffer: []const u8, config: ParserConfig) ParseErrors!struct { usize, JsonValue } {
+fn parseArray(allocator: Allocator, buffer: []const u8, comptime config: ParserConfig) ParseErrors!struct { usize, JsonValue } {
     const ptr = try allocator.create(std.ArrayList(JsonValue));
     ptr.* = std.ArrayList(JsonValue).init(allocator);
     const jsonValue = JsonValue{ .array = ptr };
@@ -620,47 +623,62 @@ fn parseArray(allocator: Allocator, buffer: []const u8, config: ParserConfig) Pa
     return .{ pos, jsonValue };
 }
 
+fn findNextChar(buffer: []const u8, target: []const u8) usize {
+    for (buffer, 0..) |char, pos| {
+        for (target) |fchar| if (char == fchar) return pos;
+    }
+    return buffer.len;
+}
+
 /// Parse a string from the provided slice
 /// Returns the index of the next character to read
-fn parseStringWithTerminal(allocator: Allocator, buffer: []const u8, config: ParserConfig, terminal: u8) ParseErrors!struct { usize, JsonValue } {
+fn parseStringWithTerminal(allocator: Allocator, buffer: []const u8, comptime config: ParserConfig, terminal: u8) ParseErrors!struct { usize, JsonValue } {
     const ipos = try expectUpTo(buffer, config, terminal);
-    var slashCount: usize = 0;
     var characters = std.ArrayList(u8).init(allocator);
     defer characters.deinit();
 
     var pos: usize = ipos;
-    while (pos < buffer.len) : (pos += 1) {
+    var last_pos: usize = pos;
+    while (pos < buffer.len) {
+        pos += findNextChar(buffer[pos..], &[_]u8{ TOKEN_REVERSE_SOLIDUS, terminal });
         const c = buffer[pos];
-        if (c == terminal and slashCount % 2 == 0) break;
+        if (c == terminal) {
+            if (last_pos < pos) try characters.appendSlice(buffer[last_pos..pos]);
+            break;
+        }
         switch (c) {
             TOKEN_REVERSE_SOLIDUS => {
-                slashCount += 1;
-                if (slashCount % 2 == 0) try characters.append(c);
-            },
-            else => {
-                defer slashCount = 0;
-                if (slashCount == 1) {
-                    if (c == 'u') {
-                        if (buffer.len < pos + 6) return error.ParseStringError;
-                        const intValue = try std.fmt.parseInt(u21, buffer[pos + 1 .. pos + 5], 16);
+                defer last_pos = pos;
+                try characters.appendSlice(buffer[last_pos..pos]);
+                if (pos + 1 >= buffer.len) return error.ParseStringError;
+                const nc = buffer[pos + 1];
+                pos += 2;
+                switch (nc) {
+                    // Codepoint
+                    'u' => {
+                        if (buffer.len < pos + 4) return error.ParseStringError;
+                        const intValue = try std.fmt.parseInt(u21, buffer[pos .. pos + 4], 16);
                         var buf: [4]u8 = undefined;
                         const len = try std.unicode.utf8Encode(intValue, &buf);
-                        var li: usize = 0;
-                        while (li < len) : (li += 1) try characters.append(buf[li]);
+                        try characters.appendSlice(buf[0..len]);
                         pos += 4;
-                    } else {
-                        switch (c) {
-                            'b' => try characters.append(8),
-                            't' => try characters.append(9),
-                            'n' => try characters.append(10),
-                            'f' => try characters.append(12),
-                            'r' => try characters.append(13),
-                            '"' => try characters.append('"'),
-                            '\\' => try characters.append('\\'),
-                            else => return error.ParseStringError,
-                        }
-                    }
-                } else try characters.append(c);
+                    },
+                    // Double backslash
+                    // Control characters
+                    'b' => try characters.append(8),
+                    't' => try characters.append(9),
+                    'n' => try characters.append(10),
+                    'f' => try characters.append(12),
+                    'r' => try characters.append(13),
+                    '"' => try characters.append('"'),
+                    '\'' => try characters.append('\''),
+                    '\\' => try characters.append('\\'),
+                    else => return error.ParseStringError,
+                }
+            },
+            else => {
+                defer last_pos = pos;
+                try characters.appendSlice(buffer[last_pos..pos]);
             },
         }
     }
@@ -674,7 +692,7 @@ fn parseStringWithTerminal(allocator: Allocator, buffer: []const u8, config: Par
 
 /// Parse a number from the provided slice
 /// Returns the index of the next character to read
-fn parseNumber(allocator: Allocator, buffer: []const u8, config: ParserConfig) ParseErrors!struct { usize, JsonValue } {
+fn parseNumber(allocator: Allocator, buffer: []const u8, comptime config: ParserConfig) ParseErrors!struct { usize, JsonValue } {
     var encodingType = NumberEncoding.integer;
     var pos = try trimLeftWhitespace(buffer, config);
     var startingDigitAt: usize = 0;
@@ -690,11 +708,20 @@ fn parseNumber(allocator: Allocator, buffer: []const u8, config: ParserConfig) P
     const new_buffer = buffer[pos..];
 
     // First character can be a minus or number
-    if (config.parserType == ParserType.json5 and isPlusOrMinus(new_buffer[0]) or config.parserType == ParserType.rfc8259 and new_buffer[0] == TOKEN_MINUS) {
-        polarity = if (new_buffer[0] == TOKEN_MINUS) -1 else 1;
-        try numberList.append(new_buffer[0]);
-        startingDigitAt += 1;
-        pos += 1;
+
+    switch (config.parserType) {
+        .json5 => if (isPlusOrMinus(new_buffer[0])) {
+            polarity = if (new_buffer[0] == TOKEN_MINUS) -1 else 1;
+            try numberList.append(new_buffer[0]);
+            startingDigitAt += 1;
+            pos += 1;
+        },
+        .rfc8259 => if (new_buffer[0] == TOKEN_MINUS) {
+            polarity = -1;
+            try numberList.append(new_buffer[0]);
+            startingDigitAt += 1;
+            pos += 1;
+        },
     }
 
     if (new_buffer.len <= startingDigitAt) {
@@ -702,15 +729,17 @@ fn parseNumber(allocator: Allocator, buffer: []const u8, config: ParserConfig) P
         return error.ParseNumberError;
     }
 
-    if (config.parserType == ParserType.json5 and isReservedInfinity(buffer[pos..])) {
-        pos += try expectWord(buffer[pos..], TOKEN_INFINITY);
-        return .{ pos, if (polarity > 0) JSON_POSITIVE_INFINITY else JSON_NEGATIVE_INFINITY };
-    }
-
-    if (config.parserType == ParserType.json5 and isReservedNan(buffer[pos..])) {
-        pos += try expectWord(buffer[pos..], TOKEN_NAN);
-        return .{ pos, if (polarity > 0) JSON_POSITIVE_NAN else JSON_NEGATIVE_NAN };
-    }
+    if (comptime config.parserType == .json5) switch (buffer[pos]) {
+        TOKEN_NAN[0] => {
+            pos += try expectWord(buffer[pos..], TOKEN_NAN);
+            return .{ pos, if (polarity > 0) JSON_POSITIVE_NAN else JSON_NEGATIVE_NAN };
+        },
+        TOKEN_INFINITY[0] => {
+            pos += try expectWord(buffer[pos..], TOKEN_INFINITY);
+            return .{ pos, if (polarity > 0) JSON_POSITIVE_INFINITY else JSON_NEGATIVE_INFINITY };
+        },
+        else => {},
+    };
 
     // Next character either is a digit or a .
 
@@ -738,7 +767,7 @@ fn parseNumber(allocator: Allocator, buffer: []const u8, config: ParserConfig) P
             pos += 1;
         },
         TOKEN_PERIOD => {
-            if (config.parserType == ParserType.rfc8259) {
+            if (comptime config.parserType == ParserType.rfc8259) {
                 debug("Invalid number; RFS8259 doesn't support floating point numbers starting with a decimal point", .{});
                 return error.ParseNumberError;
             }
@@ -794,23 +823,15 @@ fn parseNumber(allocator: Allocator, buffer: []const u8, config: ParserConfig) P
 
     if (pos > buffer.len) @panic("Fail");
 
-    var numberString = try allocator.dupe(u8, numberList.items);
-    defer allocator.free(numberString);
-
-    // TODO: Figure out why this block couldn't be in the switch below; kept complaining about not being able to
-    //  initialize the union
-    var hexBuffer: []const u8 = undefined;
-    if (encodingType == NumberEncoding.hex) {
-        hexBuffer = numberString[startingDigitAt + 2 .. numberString.len];
-    }
-
-    return switch (encodingType) {
-        NumberEncoding.integer => .{ pos, .{ .integer = try std.fmt.parseInt(i64, numberString, 10) } },
-        NumberEncoding.float => .{ pos, .{ .float = try std.fmt.parseFloat(f64, numberString) } },
+    switch (encodingType) {
+        NumberEncoding.integer => return .{ pos, .{ .integer = try std.fmt.parseInt(i64, numberList.items, 10) } },
+        NumberEncoding.float => return .{ pos, .{ .float = try std.fmt.parseFloat(f64, numberList.items) } },
         // parseInt doesn't support 0x so we have to skip it and manually apply the sign
-        NumberEncoding.hex => .{ pos, .{ .integer = polarity * try std.fmt.parseInt(i64, hexBuffer, 16) } },
+        NumberEncoding.hex => {
+            return .{ pos, .{ .integer = polarity * try std.fmt.parseInt(i64, numberList.items[startingDigitAt + 2 .. numberList.items.len], 16) } };
+        },
         else => return error.ParseNumberError,
-    };
+    }
 }
 
 // TODO: Drop the JsonValue return
@@ -836,8 +857,7 @@ fn parseEcmaScript51Identifier(allocator: Allocator, buffer: []const u8) ParseEr
                 const intValue = try std.fmt.parseInt(u21, buffer[pos .. pos + 4], 16);
                 var buf: [4]u8 = undefined;
                 const len = try std.unicode.utf8Encode(intValue, &buf);
-                var i: usize = 0;
-                while (i < len) : (i += 1) try characters.append(buf[i]);
+                try characters.appendSlice(buf[0..len]);
                 pos += 3;
             },
             else => try characters.append(c),
@@ -851,7 +871,7 @@ fn parseEcmaScript51Identifier(allocator: Allocator, buffer: []const u8) ParseEr
 
 /// Expects the next significant character be token, skipping over all leading and trailing
 /// insignificant whitespace, or returns UnexpectedTokenError.
-fn expect(buffer: []const u8, config: ParserConfig, token: u8) ParseErrors!usize {
+fn expect(buffer: []const u8, comptime config: ParserConfig, token: u8) ParseErrors!usize {
     var pos = try trimLeftWhitespace(buffer, config);
     const new_buffer = buffer[pos..];
     if (new_buffer.len < 1) {
@@ -869,7 +889,7 @@ fn expect(buffer: []const u8, config: ParserConfig, token: u8) ParseErrors!usize
 
 /// Expects the next significant character be token, skipping over all leading insignificant
 /// whitespace, or returns UnexpectedTokenError.
-fn expectUpTo(buffer: []const u8, config: ParserConfig, token: u8) ParseErrors!usize {
+fn expectUpTo(buffer: []const u8, comptime config: ParserConfig, token: u8) ParseErrors!usize {
     const pos = try trimLeftWhitespace(buffer, config);
     if (buffer[pos] != token) {
         debug("Expected {c} found {c}", .{ token, buffer[pos] });
@@ -880,7 +900,7 @@ fn expectUpTo(buffer: []const u8, config: ParserConfig, token: u8) ParseErrors!u
 
 /// Returns the index in the string with the next, significant character
 /// starting from the beginning.
-fn trimLeftWhitespace(buffer: []const u8, config: ParserConfig) ParseErrors!usize {
+fn trimLeftWhitespace(buffer: []const u8, comptime config: ParserConfig) ParseErrors!usize {
     // Skip any whitespace
     const pos = pos: {
         for (buffer, 0..) |c, p| if (!isInsignificantWhitespace(c, config)) break :pos p;
@@ -936,7 +956,7 @@ fn isComment(buffer: []const u8) bool {
 
 /// Returns true if a character matches the RFC8259 grammar specificiation for
 /// insignificant whitespace.
-fn isInsignificantWhitespace(char: u8, config: ParserConfig) bool {
+fn isInsignificantWhitespace(char: u8, comptime config: ParserConfig) bool {
     if (config.parserType == ParserType.rfc8259) {
         switch (char) {
             TOKEN_HORIZONTAL_TAB, TOKEN_NEW_LINE, TOKEN_CARRIAGE_RETURN, TOKEN_SPACE => return true,
@@ -972,11 +992,6 @@ fn isNumber(char: u8) bool {
     return (char >= 48 and char <= 57);
 }
 
-fn isReservedFalse(buffer: []const u8) bool {
-    if (buffer.len < 5) return false;
-    return buffer[0] == TOKEN_FALSE[0];
-}
-
 fn isReservedInfinity(buffer: []const u8) bool {
     if (buffer.len < 8) return false;
     return buffer[0] == TOKEN_INFINITY[0];
@@ -987,23 +1002,13 @@ fn isReservedNan(buffer: []const u8) bool {
     return buffer[0] == TOKEN_NAN[0] and buffer[1] == TOKEN_NAN[1];
 }
 
-fn isReservedNull(buffer: []const u8) bool {
-    if (buffer.len < 4) return false;
-    return buffer[0] == TOKEN_NULL[0] and buffer[1] == TOKEN_NULL[1];
-}
-
-fn isReservedTrue(buffer: []const u8) bool {
-    if (buffer.len < 4) return false;
-    return buffer[0] == TOKEN_TRUE[0];
-}
-
 fn expectWord(buffer: []const u8, word: []const u8) ParseError!usize {
     if (buffer.len < word.len) return error.ParseValueError;
     if (!std.mem.eql(u8, buffer[0..word.len], word)) return error.ParseValueError;
     return word.len;
 }
 
-fn expectNothingNext(buffer: []const u8, config: ParserConfig) ParseErrors!void {
+fn expectNothingNext(buffer: []const u8, comptime config: ParserConfig) ParseErrors!void {
     if (buffer.len == 0) return;
     if (isInsignificantWhitespace(buffer[0], config)) return;
     switch (buffer[0]) {
@@ -1059,7 +1064,7 @@ fn debug(comptime msg: []const u8, args: anytype) void {
 
 /// Helper for testing parsed numbers - only calls parseNumber
 /// number can be an expected number or an expected error
-fn expectParseNumberToParseNumber(number: anytype, text: []const u8, config: ParserConfig) !void {
+fn expectParseNumberToParseNumber(number: anytype, text: []const u8, comptime config: ParserConfig) !void {
     const allocator = std.testing.allocator;
 
     var value = v: {
@@ -2037,7 +2042,7 @@ test "README.md simple test json5" {
 test "README.md simple test with stream source" {
     const allocator = std.testing.allocator;
 
-    const source = 
+    const source =
         \\{
         \\  foo: [
         \\    /* Some
