@@ -453,8 +453,8 @@ fn parseValue(allocator: Allocator, buffer: []const u8, comptime config: ParserC
                 pos += read_pos;
                 break :result result;
             },
-            // 0-9|- indicates a number
-            TOKEN_INFINITY[0], TOKEN_NAN[0], '-', '+', 48...57 => {
+            // ., 0-9, -, + indicates a number
+            TOKEN_INFINITY[0], TOKEN_NAN[0], '.', '-', '+', '0'...'9' => {
                 const read_pos, const result = try parseNumber(allocator, buffer[pos..], config);
                 pos += read_pos;
                 break :result result;
@@ -762,7 +762,7 @@ fn parseNumber(allocator: Allocator, buffer: []const u8, comptime config: Parser
                 }
             }
         },
-        49...57 => {
+        '1'...'9' => {
             try numberList.append(buffer[pos]);
             pos += 1;
         },
@@ -797,10 +797,15 @@ fn parseNumber(allocator: Allocator, buffer: []const u8, comptime config: Parser
         encodingType = NumberEncoding.float;
         try numberList.append(buffer[pos]);
         pos += 1;
+        const startingDecimalAt = pos;
         while (pos < buffer.len and isNumber(buffer[pos])) {
             try numberList.append(buffer[pos]);
             pos += 1;
         }
+        if (comptime config.parserType == ParserType.rfc8259) if (pos == startingDecimalAt) {
+            debug("Invalid number; RFS8259 doesn't support floating point numbers trailing with a decimal point", .{});
+            return error.ParseNumberError;
+        };
     }
 
     // Handle exponent
@@ -2142,6 +2147,34 @@ test "Escaped Strings" {
         defer value.deinit(allocator);
         try std.testing.expect(value == .string);
         try std.testing.expectEqualStrings(&[_]u8{ 8, 8, 8 }, value.asString());
+    }
+}
+
+test "Leading and Trailing Numbers" {
+    const allocator = std.testing.allocator;
+
+    {
+        _, const value = try parseValue(allocator, ".123", CONFIG_JSON5);
+        defer value.deinit(allocator);
+        try std.testing.expect(value == .float);
+        try std.testing.expectEqual(0.123, value.asFloat());
+    }
+
+    {
+        _, const value = try parseValue(allocator, "123.", CONFIG_JSON5);
+        defer value.deinit(allocator);
+        try std.testing.expect(value == .float);
+        try std.testing.expectEqual(123, value.asFloat());
+    }
+
+    {
+        const err = parseValue(allocator, ".123", CONFIG_RFC8259);
+        try std.testing.expectError(ParseError.ParseNumberError, err);
+    }
+
+    {
+        const err = parseValue(allocator, "123.", CONFIG_RFC8259);
+        try std.testing.expectError(ParseError.ParseNumberError, err);
     }
 }
 
