@@ -1083,17 +1083,17 @@ fn expectParseNumberToParseNumber(number: anytype, text: []const u8, comptime co
     };
 
     switch (@typeInfo(@TypeOf(number))) {
-        .Int, @typeInfo(comptime_int) => try std.testing.expect(value == .integer),
-        .Float, @typeInfo(comptime_float) => try std.testing.expect(value == .float),
+        .int, .comptime_int => try std.testing.expect(value == .integer),
+        .float, .comptime_float => try std.testing.expect(value == .float),
         @typeInfo(ParseErrors) => {},
         else => @compileError("Eek: " ++ @typeName(@TypeOf(number))),
     }
 
     switch (@typeInfo(@TypeOf(number))) {
-        @typeInfo(comptime_int) => try std.testing.expectEqual(@as(i64, number), value.asInteger()),
-        .Int => try std.testing.expectEqual(number, value.asInteger()),
-        @typeInfo(comptime_float) => try std.testing.expectEqual(@as(f64, number), value.asFloat()),
-        .Float => try std.testing.expectEqual(number, value.asFloat()),
+        .comptime_int => try std.testing.expectEqual(@as(i64, number), value.asInteger()),
+        .int => try std.testing.expectEqual(number, value.asInteger()),
+        .comptime_float => try std.testing.expectEqual(@as(f64, number), value.asFloat()),
+        .float => try std.testing.expectEqual(number, value.asFloat()),
         @typeInfo(ParseErrors) => try std.testing.expectError(number, value),
         else => @compileError("Eek: " ++ @typeName(@TypeOf(number))),
     }
