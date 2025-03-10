@@ -4,7 +4,8 @@
     .paths = .{
         "src",
         "LICENSE",
-        "README.md",
+        "build.zig",
+        "build.zig.zon",
     },
     .fingerprint = 0x6b072545933c3cc9,
 }
