@@ -317,6 +317,49 @@ pub const JsonValue = union(enum) {
         return if (self == .boolean) self.boolean else null;
     }
 
+    const charset = "0123456789abcdef";
+    const escape_seq: []const u8 = blk: {
+        var seq: []const u8 = "\"\\";
+        for (0..32) |i|
+            seq = seq ++ [_]u8{i};
+        break :blk seq;
+    };
+    fn escapeString(writer: anytype, str: []const u8) !void {
+        try writer.writeByte('"');
+
+        var pos: usize = 0;
+        while (pos < str.len) {
+            const c = std.mem.indexOfAny(u8, str[pos..], escape_seq) orelse break;
+            try writer.writeAll(str[pos .. pos + c]);
+            pos += c;
+            switch (str[pos]) {
+                0...31, '"', '\\' => |char| {
+                    pos += 1;
+                    switch (char) {
+                        8 => try writer.writeAll("\\b"),
+                        '\t' => try writer.writeAll("\\t"),
+                        '\n' => try writer.writeAll("\\n"),
+                        12 => try writer.writeAll("\\f"),
+                        '\r' => try writer.writeAll("\\r"),
+                        '"', '\\' => {
+                            try writer.writeByte('\\');
+                            try writer.writeByte(char);
+                        },
+                        else => {
+                            try writer.writeAll("\\u00");
+                            try writer.writeByte(charset[char >> 4]);
+                            try writer.writeByte(charset[char & 15]);
+                        },
+                    }
+                },
+                else => unreachable,
+            }
+        }
+        if (pos < str.len)
+            try writer.writeAll(str[pos..]);
+        try writer.writeByte('"');
+    }
+
     /// Serialize the JSON value to a writer
     pub fn serialize(self: JsonValue, writer: anytype, indent: JsonIndent, depth: usize) anyerror!void {
         switch (self) {
@@ -325,7 +368,7 @@ pub const JsonValue = union(enum) {
                 try writer.print("{d}", .{i});
             },
             .float => |f| try writer.print("{d}", .{f}),
-            .string, .static_string => |s| try writer.print("\"{s}\"", .{s}),
+            .string, .static_string => |s| try escapeString(writer, s),
             .boolean => |b| try writer.print("{any}", .{b}),
             .nil => try writer.print("null", .{}),
             .object => |o| {
