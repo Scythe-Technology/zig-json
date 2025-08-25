@@ -133,7 +133,7 @@ pub const JsonIndent = enum {
     TABS,
 };
 
-fn serializerWriteIndent(writer: anytype, indentKind: JsonIndent, depth: usize) !void {
+fn serializerWriteIndent(writer: *std.Io.Writer, indentKind: JsonIndent, depth: usize) !void {
     const indent = switch (indentKind) {
         .NO_LINE => return,
         .SPACES_2 => "  ",
@@ -159,8 +159,9 @@ pub const JsonValue = union(enum) {
         switch (self) {
             .string => |str| allocator.free(str),
             .array => |arr| {
-                for (arr.items) |*item| item.deinit(allocator);
-                arr.deinit();
+                for (arr.items) |*item|
+                    item.deinit(allocator);
+                arr.deinit(allocator);
                 allocator.destroy(arr);
             },
             .object => |obj| {
@@ -232,9 +233,9 @@ pub const JsonValue = union(enum) {
     }
 
     /// Handy pass-thru to typed append(...) calls
-    pub fn append(self: JsonValue, value: JsonValue) !void {
+    pub fn append(self: JsonValue, allocator: Allocator, value: JsonValue) !void {
         return switch (self) {
-            .array => |arr| try arr.append(value),
+            .array => |arr| try arr.append(allocator, value),
             .nil => @panic("Cannot append() to a null value"),
             else => |t| std.debug.panic("'{s}' type doesn't support append()", .{@tagName(t)}),
         };
@@ -361,7 +362,7 @@ pub const JsonValue = union(enum) {
     }
 
     /// Serialize the JSON value to a writer
-    pub fn serialize(self: JsonValue, writer: anytype, indent: JsonIndent, depth: usize) anyerror!void {
+    pub fn serialize(self: JsonValue, writer: *std.Io.Writer, indent: JsonIndent, depth: usize) anyerror!void {
         switch (self) {
             .integer => |i| {
                 if (depth > 0) try serializerWriteIndent(writer, indent, depth);
@@ -429,7 +430,7 @@ pub const JsonRoot = struct {
 
     pub fn newArray(self: *JsonRoot) !JsonValue {
         const ptr = try self.allocator.create(std.ArrayList(JsonValue));
-        ptr.* = std.ArrayList(JsonValue).init(self.allocator);
+        ptr.* = .empty;
         return JsonValue{ .array = ptr };
     }
 };
@@ -629,7 +630,7 @@ fn parseObject(allocator: Allocator, buffer: []const u8, comptime config: Parser
 ///  starts after that point.
 fn parseArray(allocator: Allocator, buffer: []const u8, comptime config: ParserConfig) ParseErrors!struct { usize, JsonValue } {
     const ptr = try allocator.create(std.ArrayList(JsonValue));
-    ptr.* = std.ArrayList(JsonValue).init(allocator);
+    ptr.* = .empty;
     const jsonValue = JsonValue{ .array = ptr };
     const jsonArray = jsonValue.array;
     errdefer jsonValue.deinit(allocator);
@@ -655,7 +656,7 @@ fn parseArray(allocator: Allocator, buffer: []const u8, comptime config: ParserC
         const read_pos, const value = try parseValue(allocator, buffer[pos..], config);
         errdefer value.deinit(allocator);
         pos += read_pos;
-        try jsonArray.append(value);
+        try jsonArray.append(allocator, value);
     }
 
     if (wasLastComma and config.parserType != ParserType.json5) return error.UnexpectedTokenError;
@@ -677,8 +678,8 @@ fn findNextChar(buffer: []const u8, target: []const u8) usize {
 /// Returns the index of the next character to read
 fn parseStringWithTerminal(allocator: Allocator, buffer: []const u8, comptime config: ParserConfig, terminal: u8) ParseErrors!struct { usize, JsonValue } {
     const ipos = try expectUpTo(buffer, config, terminal);
-    var characters = std.ArrayList(u8).init(allocator);
-    defer characters.deinit();
+    var characters: std.ArrayList(u8) = .empty;
+    defer characters.deinit(allocator);
 
     var pos: usize = ipos;
     var last_pos: usize = pos;
@@ -686,13 +687,13 @@ fn parseStringWithTerminal(allocator: Allocator, buffer: []const u8, comptime co
         pos += findNextChar(buffer[pos..], &[_]u8{ TOKEN_REVERSE_SOLIDUS, terminal });
         const c = buffer[pos];
         if (c == terminal) {
-            if (last_pos < pos) try characters.appendSlice(buffer[last_pos..pos]);
+            if (last_pos < pos) try characters.appendSlice(allocator, buffer[last_pos..pos]);
             break;
         }
         switch (c) {
             TOKEN_REVERSE_SOLIDUS => {
                 defer last_pos = pos;
-                try characters.appendSlice(buffer[last_pos..pos]);
+                try characters.appendSlice(allocator, buffer[last_pos..pos]);
                 if (pos + 1 >= buffer.len) return error.ParseStringError;
                 const nc = buffer[pos + 1];
                 pos += 2;
@@ -703,25 +704,25 @@ fn parseStringWithTerminal(allocator: Allocator, buffer: []const u8, comptime co
                         const intValue = try std.fmt.parseInt(u21, buffer[pos .. pos + 4], 16);
                         var buf: [4]u8 = undefined;
                         const len = try std.unicode.utf8Encode(intValue, &buf);
-                        try characters.appendSlice(buf[0..len]);
+                        try characters.appendSlice(allocator, buf[0..len]);
                         pos += 4;
                     },
                     // Double backslash
                     // Control characters
-                    'b' => try characters.append(8),
-                    't' => try characters.append(9),
-                    'n' => try characters.append(10),
-                    'f' => try characters.append(12),
-                    'r' => try characters.append(13),
-                    '"' => try characters.append('"'),
-                    '\'' => try characters.append('\''),
-                    '\\' => try characters.append('\\'),
+                    'b' => try characters.append(allocator, 8),
+                    't' => try characters.append(allocator, 9),
+                    'n' => try characters.append(allocator, 10),
+                    'f' => try characters.append(allocator, 12),
+                    'r' => try characters.append(allocator, 13),
+                    '"' => try characters.append(allocator, '"'),
+                    '\'' => try characters.append(allocator, '\''),
+                    '\\' => try characters.append(allocator, '\\'),
                     else => return error.ParseStringError,
                 }
             },
             else => {
                 defer last_pos = pos;
-                try characters.appendSlice(buffer[last_pos..pos]);
+                try characters.appendSlice(allocator, buffer[last_pos..pos]);
             },
         }
     }
@@ -740,8 +741,8 @@ fn parseNumber(allocator: Allocator, buffer: []const u8, comptime config: Parser
     var pos = try trimLeftWhitespace(buffer, config);
     var startingDigitAt: usize = 0;
     var polarity: isize = 1;
-    var numberList = std.ArrayList(u8).init(allocator);
-    defer numberList.deinit();
+    var numberList: std.ArrayList(u8) = .empty;
+    defer numberList.deinit(allocator);
 
     if (buffer[pos..].len < 1) {
         debug("Number cannot be zero length", .{});
@@ -755,13 +756,13 @@ fn parseNumber(allocator: Allocator, buffer: []const u8, comptime config: Parser
     switch (config.parserType) {
         .json5 => if (isPlusOrMinus(new_buffer[0])) {
             polarity = if (new_buffer[0] == TOKEN_MINUS) -1 else 1;
-            try numberList.append(new_buffer[0]);
+            try numberList.append(allocator, new_buffer[0]);
             startingDigitAt += 1;
             pos += 1;
         },
         .rfc8259 => if (new_buffer[0] == TOKEN_MINUS) {
             polarity = -1;
-            try numberList.append(new_buffer[0]);
+            try numberList.append(allocator, new_buffer[0]);
             startingDigitAt += 1;
             pos += 1;
         },
@@ -788,7 +789,7 @@ fn parseNumber(allocator: Allocator, buffer: []const u8, comptime config: Parser
 
     switch (buffer[pos]) {
         '0' => {
-            try numberList.append('0');
+            try numberList.append(allocator, '0');
             pos += 1;
             if (pos < buffer.len) {
                 switch (buffer[pos]) {
@@ -798,7 +799,7 @@ fn parseNumber(allocator: Allocator, buffer: []const u8, comptime config: Parser
                     },
                     'x' => {
                         encodingType = NumberEncoding.hex;
-                        try numberList.append('x');
+                        try numberList.append(allocator, 'x');
                         pos += 1;
                     },
                     else => {},
@@ -806,7 +807,7 @@ fn parseNumber(allocator: Allocator, buffer: []const u8, comptime config: Parser
             }
         },
         '1'...'9' => {
-            try numberList.append(buffer[pos]);
+            try numberList.append(allocator, buffer[pos]);
             pos += 1;
         },
         TOKEN_PERIOD => {
@@ -816,7 +817,7 @@ fn parseNumber(allocator: Allocator, buffer: []const u8, comptime config: Parser
             }
 
             encodingType = NumberEncoding.float;
-            try numberList.append(buffer[pos]);
+            try numberList.append(allocator, buffer[pos]);
             pos += 1;
             if (pos >= buffer.len) {
                 debug("Invalid number; decimal value must follow decimal point", .{});
@@ -831,18 +832,18 @@ fn parseNumber(allocator: Allocator, buffer: []const u8, comptime config: Parser
 
     // Walk through each character
     while (pos < buffer.len and ((encodingType != NumberEncoding.hex and isNumber(buffer[pos])) or (encodingType == NumberEncoding.hex and isHexDigit(buffer[pos])))) {
-        try numberList.append(buffer[pos]);
+        try numberList.append(allocator, buffer[pos]);
         pos += 1;
     }
 
     // Handle decimal numbers
     if (pos < buffer.len and encodingType != NumberEncoding.hex and buffer[pos] == TOKEN_PERIOD) {
         encodingType = NumberEncoding.float;
-        try numberList.append(buffer[pos]);
+        try numberList.append(allocator, buffer[pos]);
         pos += 1;
         const startingDecimalAt = pos;
         while (pos < buffer.len and isNumber(buffer[pos])) {
-            try numberList.append(buffer[pos]);
+            try numberList.append(allocator, buffer[pos]);
             pos += 1;
         }
         if (comptime config.parserType == ParserType.rfc8259) if (pos == startingDecimalAt) {
@@ -854,17 +855,17 @@ fn parseNumber(allocator: Allocator, buffer: []const u8, comptime config: Parser
     // Handle exponent
     if (pos < buffer.len and encodingType != NumberEncoding.hex and (buffer[pos] == TOKEN_EXPONENT_LOWER or buffer[pos] == TOKEN_EXPONENT_UPPER)) {
         encodingType = NumberEncoding.float;
-        try numberList.append(buffer[pos]);
+        try numberList.append(allocator, buffer[pos]);
         pos += 1;
         if (!isNumberOrPlusOrMinus(buffer[pos])) {
             return error.ParseNumberError;
         }
         // Handle preceeding +/-
-        try numberList.append(buffer[pos]);
+        try numberList.append(allocator, buffer[pos]);
         pos += 1;
         // Handle the exponent value
         while (pos < buffer.len and isNumber(buffer[pos])) {
-            try numberList.append(buffer[pos]);
+            try numberList.append(allocator, buffer[pos]);
             pos += 1;
         }
     }
@@ -884,8 +885,8 @@ fn parseNumber(allocator: Allocator, buffer: []const u8, comptime config: Parser
 
 // TODO: Drop the JsonValue return
 fn parseEcmaScript51Identifier(allocator: Allocator, buffer: []const u8) ParseErrors!struct { usize, JsonValue } {
-    var characters = std.ArrayList(u8).init(allocator);
-    defer characters.deinit();
+    var characters: std.ArrayList(u8) = .empty;
+    defer characters.deinit(allocator);
 
     var pos: usize = 0;
     while (pos < buffer.len) : (pos += 1) {
@@ -905,10 +906,10 @@ fn parseEcmaScript51Identifier(allocator: Allocator, buffer: []const u8) ParseEr
                 const intValue = try std.fmt.parseInt(u21, buffer[pos .. pos + 4], 16);
                 var buf: [4]u8 = undefined;
                 const len = try std.unicode.utf8Encode(intValue, &buf);
-                try characters.appendSlice(buf[0..len]);
+                try characters.appendSlice(allocator, buf[0..len]);
                 pos += 3;
             },
-            else => try characters.append(c),
+            else => try characters.append(allocator, c),
         }
     }
 
@@ -2048,7 +2049,11 @@ test "README.md simple test" {
     var root = try parse(allocator, buffer);
     const bazObj = root.value.get("foo").get(4);
 
-    try bazObj.serialize(std.io.getStdErr().writer(), .SPACES_2, 0);
+    var b: [1024]u8 = undefined;
+    var file_writer = std.fs.File.stderr().writer(&b);
+    const writer = &file_writer.interface;
+    try bazObj.serialize(writer, .SPACES_2, 0);
+    try writer.flush();
 
     try std.testing.expectEqual(bazObj.get("baz").asFloat(), -13e+37);
 
@@ -2079,7 +2084,11 @@ test "README.md simple test json5" {
     var root = try parseJson5(allocator, buffer);
     const bazObj = root.value.get("foo").get(4);
 
-    try bazObj.serialize(std.io.getStdErr().writer(), .SPACES_2, 0);
+    var b: [1024]u8 = undefined;
+    var file_writer = std.fs.File.stderr().writer(&b);
+    const writer = &file_writer.interface;
+    try bazObj.serialize(writer, .SPACES_2, 0);
+    try writer.flush();
 
     try std.testing.expectEqual(bazObj.get("baz").asFloat(), -13e+37);
 
@@ -2113,7 +2122,11 @@ test "README.md simple test with stream source" {
 
     const bazObj = root.value.get("foo").get(4);
 
-    try bazObj.serialize(std.io.getStdErr().writer(), .SPACES_2, 0);
+    var buffer: [1024]u8 = undefined;
+    var file_writer = std.fs.File.stderr().writer(&buffer);
+    const writer = &file_writer.interface;
+    try bazObj.serialize(writer, .SPACES_2, 0);
+    try writer.flush();
 
     try std.testing.expectEqual(bazObj.get("baz").asFloat(), -13e+37);
 }
@@ -2235,7 +2248,11 @@ test "README.md simple test from file" {
 
     const bazObj = root.value.get("foo").get(4);
 
-    try bazObj.serialize(std.io.getStdErr().writer(), .SPACES_2, 0);
+    var buffer: [1024]u8 = undefined;
+    var file_writer = std.fs.File.stderr().writer(&buffer);
+    const writer = &file_writer.interface;
+    try bazObj.serialize(writer, .SPACES_2, 0);
+    try writer.flush();
 
     try std.testing.expectEqual(bazObj.get("baz").asFloat(), -13e+37);
 }
@@ -2244,19 +2261,22 @@ test "Custom Json Insert - Array" {
     const allocator = std.testing.allocator;
 
     const ptr = try allocator.create(std.ArrayList(JsonValue));
-    ptr.* = std.ArrayList(JsonValue).init(allocator);
+    ptr.* = .empty;
     var root = JsonRoot.init(allocator, JsonValue{
         .array = ptr,
     });
     defer root.deinit();
 
-    _ = try root.value.append(.{ .static_string = "foo" });
-    _ = try root.value.append(.{ .static_string = "foo" });
-    _ = try root.value.append(.{ .static_string = "foo" });
-    _ = try root.value.append(.{ .static_string = "foo" });
-    _ = try root.value.append(.{ .static_string = "foo" });
+    _ = try root.value.append(allocator, .{ .static_string = "foo" });
+    _ = try root.value.append(allocator, .{ .static_string = "foo" });
+    _ = try root.value.append(allocator, .{ .static_string = "foo" });
+    _ = try root.value.append(allocator, .{ .static_string = "foo" });
+    _ = try root.value.append(allocator, .{ .static_string = "foo" });
 
-    try root.value.serialize(std.io.getStdErr().writer(), .SPACES_2, 0);
+    var buffer: [1024]u8 = undefined;
+    var file_writer = std.fs.File.stderr().writer(&buffer);
+    const writer = &file_writer.interface;
+    try root.value.serialize(writer, .SPACES_2, 0);
 }
 
 test "Custom Json Insert - Object" {
@@ -2281,7 +2301,11 @@ test "Custom Json Insert - Object" {
     try std.testing.expectEqualStrings("foo", value.asString());
     try std.testing.expectEqualStrings("foo", value.stringOrNull().?);
 
-    try root.value.serialize(std.io.getStdErr().writer(), .SPACES_2, 0);
+    var buffer: [1024]u8 = undefined;
+    var file_writer = std.fs.File.stderr().writer(&buffer);
+    const writer = &file_writer.interface;
+    try root.value.serialize(writer, .SPACES_2, 0);
+    try writer.flush();
 }
 
 // Check whether tests are executed.
