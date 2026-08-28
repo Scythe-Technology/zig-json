@@ -152,7 +152,7 @@ pub const JsonValue = union(enum) {
     float: f64,
     string: []const u8,
     array: *std.ArrayList(JsonValue),
-    object: *std.StringArrayHashMap(JsonValue),
+    object: *std.array_hash_map.String(JsonValue),
     static_string: []const u8,
 
     pub fn deinit(self: JsonValue, allocator: Allocator) void {
@@ -170,7 +170,7 @@ pub const JsonValue = union(enum) {
                     allocator.free(entry.key_ptr.*);
                     entry.value_ptr.*.deinit(allocator);
                 }
-                obj.deinit();
+                obj.deinit(allocator);
                 allocator.destroy(obj);
             },
             else => {},
@@ -189,41 +189,41 @@ pub const JsonValue = union(enum) {
     }
 
     /// Handy pass-thru to typed set(...) calls
-    pub fn set(self: JsonValue, index: anytype, value: JsonValue) !void {
+    pub fn set(self: JsonValue, allocator: Allocator, index: anytype, value: JsonValue) !void {
         switch (self) {
             // Figure out a better way to do this
             .object => |obj| if (@TypeOf(index) != usize and @TypeOf(index) != comptime_int) {
                 if (obj.getEntry(index)) |entry| {
-                    entry.value_ptr.deinit(obj.allocator);
-                    _ = try obj.fetchPut(index, value);
+                    entry.value_ptr.deinit(allocator);
+                    _ = try obj.fetchPut(allocator, index, value);
                 } else {
-                    const key_copy = try obj.allocator.dupe(u8, index);
-                    errdefer obj.allocator.free(key_copy);
-                    _ = try obj.fetchPut(key_copy, value);
+                    const key_copy = try allocator.dupe(u8, index);
+                    errdefer allocator.free(key_copy);
+                    _ = try obj.fetchPut(allocator, key_copy, value);
                 }
             } else @panic("Invalid key type"),
             .array => |arr| if (@TypeOf(index) == usize or @TypeOf(index) == comptime_int) {
                 if (arr.items.len < index) return error.OutOfBounds;
                 var old = arr.items[index];
                 arr.items[index] = value;
-                old.deinit(arr.allocator);
+                old.deinit(allocator);
             } else @panic("Invalid key type"),
             .nil => @panic("Cannot set() on a null value"),
             else => |t| std.debug.panic("'{s}' type doesn't support set()", .{@tagName(t)}),
         }
     }
 
-    pub fn setWith(self: JsonValue, index: anytype, value: JsonValue) !JsonValue {
+    pub fn setWith(self: JsonValue, allocator: Allocator, index: anytype, value: JsonValue) !JsonValue {
         switch (self) {
             // Figure out a better way to do this
             .object => |obj| if (@TypeOf(index) != usize and @TypeOf(index) != comptime_int) {
                 if (obj.getEntry(index)) |entry| {
-                    entry.value_ptr.deinit(obj.allocator);
-                    _ = try obj.fetchPut(index, value);
+                    entry.value_ptr.deinit(allocator);
+                    _ = try obj.fetchPut(allocator, index, value);
                 } else {
-                    const key_copy = try obj.allocator.dupe(u8, index);
-                    errdefer obj.allocator.free(key_copy);
-                    _ = try obj.fetchPut(key_copy, value);
+                    const key_copy = try allocator.dupe(u8, index);
+                    errdefer allocator.free(key_copy);
+                    _ = try obj.fetchPut(allocator, key_copy, value);
                 }
                 return value;
             } else @panic("Invalid key type"),
@@ -261,7 +261,7 @@ pub const JsonValue = union(enum) {
     }
 
     /// Returns the object value or panics
-    pub fn asObject(self: JsonValue) *std.StringArrayHashMap(JsonValue) {
+    pub fn asObject(self: JsonValue) *std.array_hash_map.String(JsonValue) {
         return if (self == .object) self.object else @panic("Not an object");
     }
 
@@ -294,7 +294,7 @@ pub const JsonValue = union(enum) {
     }
 
     /// Returns the object value or null
-    pub fn objectOrNull(self: JsonValue) ?*std.StringArrayHashMap(JsonValue) {
+    pub fn objectOrNull(self: JsonValue) ?*std.array_hash_map.String(JsonValue) {
         return if (self == .object) self.object else null;
     }
 
@@ -423,8 +423,8 @@ pub const JsonRoot = struct {
     }
 
     pub fn newObject(self: *JsonRoot) !JsonValue {
-        const ptr = try self.allocator.create(std.StringArrayHashMap(JsonValue));
-        ptr.* = std.StringArrayHashMap(JsonValue).init(self.allocator);
+        const ptr = try self.allocator.create(std.array_hash_map.String(JsonValue));
+        ptr.* = std.array_hash_map.String(JsonValue).init(self.allocator);
         return JsonValue{ .object = ptr };
     }
 
@@ -549,8 +549,8 @@ fn parseValue(allocator: Allocator, buffer: []const u8, comptime config: ParserC
 /// Note: parseObject _assumes_ the leading { has been stripped and jsonString
 ///  starts after that point.
 fn parseObject(allocator: Allocator, buffer: []const u8, comptime config: ParserConfig) ParseErrors!struct { usize, JsonValue } {
-    const ptr = try allocator.create(std.StringArrayHashMap(JsonValue));
-    ptr.* = std.StringArrayHashMap(JsonValue).init(allocator);
+    const ptr = try allocator.create(std.array_hash_map.String(JsonValue));
+    ptr.* = .empty;
     const jsonValue = JsonValue{ .object = ptr };
     const jsonObject = jsonValue.object;
     errdefer jsonValue.deinit(allocator);
@@ -610,7 +610,7 @@ fn parseObject(allocator: Allocator, buffer: []const u8, comptime config: Parser
         const read_pos, const value = try parseValue(allocator, buffer[pos..], config);
         errdefer value.deinit(allocator);
         pos += read_pos;
-        try jsonObject.put(key_string, value);
+        try jsonObject.put(allocator, key_string, value);
     }
 
     if (!closed) {
@@ -2050,7 +2050,7 @@ test "README.md simple test" {
     const bazObj = root.value.get("foo").get(4);
 
     var b: [1024]u8 = undefined;
-    var file_writer = std.fs.File.stderr().writer(&b);
+    var file_writer = std.Io.File.stderr().writer(std.testing.io, &b);
     const writer = &file_writer.interface;
     try bazObj.serialize(writer, .SPACES_2, 0);
     try writer.flush();
@@ -2085,7 +2085,7 @@ test "README.md simple test json5" {
     const bazObj = root.value.get("foo").get(4);
 
     var b: [1024]u8 = undefined;
-    var file_writer = std.fs.File.stderr().writer(&b);
+    var file_writer = std.Io.File.stderr().writer(std.testing.io, &b);
     const writer = &file_writer.interface;
     try bazObj.serialize(writer, .SPACES_2, 0);
     try writer.flush();
@@ -2123,7 +2123,7 @@ test "README.md simple test with stream source" {
     const bazObj = root.value.get("foo").get(4);
 
     var buffer: [1024]u8 = undefined;
-    var file_writer = std.fs.File.stderr().writer(&buffer);
+    var file_writer = std.Io.File.stderr().writer(std.testing.io, &buffer);
     const writer = &file_writer.interface;
     try bazObj.serialize(writer, .SPACES_2, 0);
     try writer.flush();
@@ -2237,10 +2237,12 @@ test "Leading and Trailing Numbers" {
 test "README.md simple test from file" {
     const allocator = std.testing.allocator;
 
-    const file = try std.fs.cwd().openFile("testFiles/some.json", .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().openFile(std.testing.io, "testFiles/some.json", .{});
+    defer file.close(std.testing.io);
 
-    const content = try file.readToEndAlloc(allocator, std.math.maxInt(usize));
+    var reader = file.reader(std.testing.io, &.{});
+
+    const content = try reader.interface.allocRemaining(allocator, .unlimited);
     defer allocator.free(content);
 
     var root = try parse(allocator, content);
@@ -2249,7 +2251,7 @@ test "README.md simple test from file" {
     const bazObj = root.value.get("foo").get(4);
 
     var buffer: [1024]u8 = undefined;
-    var file_writer = std.fs.File.stderr().writer(&buffer);
+    var file_writer = std.Io.File.stderr().writer(std.testing.io, &buffer);
     const writer = &file_writer.interface;
     try bazObj.serialize(writer, .SPACES_2, 0);
     try writer.flush();
@@ -2274,7 +2276,7 @@ test "Custom Json Insert - Array" {
     _ = try root.value.append(allocator, .{ .static_string = "foo" });
 
     var buffer: [1024]u8 = undefined;
-    var file_writer = std.fs.File.stderr().writer(&buffer);
+    var file_writer = std.Io.File.stderr().writer(std.testing.io, &buffer);
     const writer = &file_writer.interface;
     try root.value.serialize(writer, .SPACES_2, 0);
 }
@@ -2282,19 +2284,19 @@ test "Custom Json Insert - Array" {
 test "Custom Json Insert - Object" {
     const allocator = std.testing.allocator;
 
-    const ptr = try allocator.create(std.StringArrayHashMap(JsonValue));
-    ptr.* = std.StringArrayHashMap(JsonValue).init(allocator);
+    const ptr = try allocator.create(std.array_hash_map.String(JsonValue));
+    ptr.* = .empty;
     var root = JsonRoot.init(allocator, JsonValue{
         .object = ptr,
     });
     defer root.deinit();
 
-    try root.value.set("test", .{ .static_string = "foo" });
-    try root.value.set("test", .{ .static_string = "foo" });
-    try root.value.set("test", .{ .static_string = "foo" });
-    try root.value.set("test", .{ .static_string = "foo" });
-    try root.value.set("test", .{ .static_string = "foo" });
-    const value = try root.value.setWith("test", .{ .static_string = "foo" });
+    try root.value.set(allocator, "test", .{ .static_string = "foo" });
+    try root.value.set(allocator, "test", .{ .static_string = "foo" });
+    try root.value.set(allocator, "test", .{ .static_string = "foo" });
+    try root.value.set(allocator, "test", .{ .static_string = "foo" });
+    try root.value.set(allocator, "test", .{ .static_string = "foo" });
+    const value = try root.value.setWith(allocator, "test", .{ .static_string = "foo" });
 
     try std.testing.expect(value == .static_string);
     try std.testing.expectEqualStrings("foo", value.static_string);
@@ -2302,7 +2304,7 @@ test "Custom Json Insert - Object" {
     try std.testing.expectEqualStrings("foo", value.stringOrNull().?);
 
     var buffer: [1024]u8 = undefined;
-    var file_writer = std.fs.File.stderr().writer(&buffer);
+    var file_writer = std.Io.File.stderr().writer(std.testing.io, &buffer);
     const writer = &file_writer.interface;
     try root.value.serialize(writer, .SPACES_2, 0);
     try writer.flush();

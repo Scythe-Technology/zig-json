@@ -1,6 +1,7 @@
 .{
     .name = .json,
     .version = "0.2.0",
+    .minimum_zig_version = "0.16.0",
     .paths = .{
         "src",
         "LICENSE",
