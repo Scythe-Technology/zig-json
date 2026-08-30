@@ -145,17 +145,29 @@ fn serializerWriteIndent(writer: *std.Io.Writer, indentKind: JsonIndent, depth: 
     }
 }
 
-pub const JsonValue = union(enum) {
+pub const Value = union(enum) {
     nil: void,
     boolean: bool,
     integer: i64,
     float: f64,
     string: []const u8,
-    array: *std.ArrayList(JsonValue),
-    object: *std.array_hash_map.String(JsonValue),
+    array: *std.ArrayList(Value),
+    object: *std.array_hash_map.String(Value),
     static_string: []const u8,
 
-    pub fn deinit(self: JsonValue, allocator: Allocator) void {
+    pub fn newObject(allocator: Allocator) !Value {
+        const ptr = try allocator.create(std.array_hash_map.String(Value));
+        ptr.* = .empty;
+        return .{ .object = ptr };
+    }
+
+    pub fn newArray(allocator: Allocator) !Value {
+        const ptr = try allocator.create(std.ArrayList(Value));
+        ptr.* = .empty;
+        return .{ .array = ptr };
+    }
+
+    pub fn deinit(self: Value, allocator: Allocator) void {
         switch (self) {
             .string => |str| allocator.free(str),
             .array => |arr| {
@@ -178,7 +190,7 @@ pub const JsonValue = union(enum) {
     }
 
     /// Handy pass-thru to typed get(...) calls
-    pub fn get(self: JsonValue, index: anytype) JsonValue {
+    pub fn get(self: Value, index: anytype) Value {
         return switch (self) {
             // Figure out a better way to do this
             .object => |obj| if (@TypeOf(index) != usize and @TypeOf(index) != comptime_int) obj.get(index) orelse @panic("No such key") else @panic("Invalid key type"),
@@ -189,7 +201,7 @@ pub const JsonValue = union(enum) {
     }
 
     /// Handy pass-thru to typed set(...) calls
-    pub fn set(self: JsonValue, allocator: Allocator, index: anytype, value: JsonValue) !void {
+    pub fn set(self: Value, allocator: Allocator, index: anytype, value: Value) !void {
         switch (self) {
             // Figure out a better way to do this
             .object => |obj| if (@TypeOf(index) != usize and @TypeOf(index) != comptime_int) {
@@ -213,7 +225,7 @@ pub const JsonValue = union(enum) {
         }
     }
 
-    pub fn setWith(self: JsonValue, allocator: Allocator, index: anytype, value: JsonValue) !JsonValue {
+    pub fn setWith(self: Value, allocator: Allocator, index: anytype, value: Value) !Value {
         switch (self) {
             // Figure out a better way to do this
             .object => |obj| if (@TypeOf(index) != usize and @TypeOf(index) != comptime_int) {
@@ -233,7 +245,7 @@ pub const JsonValue = union(enum) {
     }
 
     /// Handy pass-thru to typed append(...) calls
-    pub fn append(self: JsonValue, allocator: Allocator, value: JsonValue) !void {
+    pub fn append(self: Value, allocator: Allocator, value: Value) !void {
         return switch (self) {
             .array => |arr| try arr.append(allocator, value),
             .nil => @panic("Cannot append() to a null value"),
@@ -242,7 +254,7 @@ pub const JsonValue = union(enum) {
     }
 
     /// Handy pass-thru to typed len(...) calls
-    pub fn len(self: JsonValue) usize {
+    pub fn len(self: Value) usize {
         return switch (self) {
             // Figure out a better way to do this
             .object => |obj| obj.count(),
@@ -253,7 +265,7 @@ pub const JsonValue = union(enum) {
     }
 
     /// Returns the string value or panics
-    pub fn asString(self: JsonValue) []const u8 {
+    pub fn asString(self: Value) []const u8 {
         return switch (self) {
             .static_string, .string => |s| s,
             else => @panic("Not a string"),
@@ -261,32 +273,32 @@ pub const JsonValue = union(enum) {
     }
 
     /// Returns the object value or panics
-    pub fn asObject(self: JsonValue) *std.array_hash_map.String(JsonValue) {
+    pub fn asObject(self: Value) *std.array_hash_map.String(Value) {
         return if (self == .object) self.object else @panic("Not an object");
     }
 
     /// Returns the integer value or panics
-    pub fn asInteger(self: JsonValue) i64 {
+    pub fn asInteger(self: Value) i64 {
         return if (self == .integer) self.integer else @panic("Not an number");
     }
 
     /// Returns the float value or panics
-    pub fn asFloat(self: JsonValue) f64 {
+    pub fn asFloat(self: Value) f64 {
         return if (self == .float) self.float else @panic("Not an float");
     }
 
     /// Returns the array value or panics
-    pub fn asArray(self: JsonValue) *std.ArrayList(JsonValue) {
+    pub fn asArray(self: Value) *std.ArrayList(Value) {
         return if (self == .array) self.array else @panic("Not an array");
     }
 
     /// Returns the array value or panics
-    pub fn asBoolean(self: JsonValue) bool {
+    pub fn asBoolean(self: Value) bool {
         return if (self == .boolean) self.boolean else @panic("Not a boolean");
     }
 
     /// Returns the string value or null
-    pub fn stringOrNull(self: JsonValue) ?[]const u8 {
+    pub fn stringOrNull(self: Value) ?[]const u8 {
         return switch (self) {
             .static_string, .string => |s| s,
             else => null,
@@ -294,27 +306,27 @@ pub const JsonValue = union(enum) {
     }
 
     /// Returns the object value or null
-    pub fn objectOrNull(self: JsonValue) ?*std.array_hash_map.String(JsonValue) {
+    pub fn objectOrNull(self: Value) ?*std.array_hash_map.String(Value) {
         return if (self == .object) self.object else null;
     }
 
     /// Returns the integer value or null
-    pub fn integerOrNull(self: JsonValue) ?i64 {
+    pub fn integerOrNull(self: Value) ?i64 {
         return if (self == .integer) self.integer else null;
     }
 
     /// Returns the float value or null
-    pub fn floatOrNull(self: JsonValue) ?f64 {
+    pub fn floatOrNull(self: Value) ?f64 {
         return if (self == .float) self.float else null;
     }
 
     /// Returns the array value or null
-    pub fn arrayOrNull(self: JsonValue) ?*std.ArrayList(JsonValue) {
+    pub fn arrayOrNull(self: Value) ?*std.ArrayList(Value) {
         return if (self == .array) self.array else null;
     }
 
     /// Returns the boolean value or null
-    pub fn booleanOrNull(self: JsonValue) ?bool {
+    pub fn booleanOrNull(self: Value) ?bool {
         return if (self == .boolean) self.boolean else null;
     }
 
@@ -362,7 +374,7 @@ pub const JsonValue = union(enum) {
     }
 
     /// Serialize the JSON value to a writer
-    pub fn serialize(self: JsonValue, writer: *std.Io.Writer, indent: JsonIndent, depth: usize) anyerror!void {
+    pub fn serialize(self: Value, writer: *std.Io.Writer, indent: JsonIndent, depth: usize) anyerror!void {
         switch (self) {
             .integer => |i| {
                 if (depth > 0) try serializerWriteIndent(writer, indent, depth);
@@ -408,30 +420,10 @@ pub const JsonValue = union(enum) {
 };
 
 pub const JsonRoot = struct {
-    allocator: Allocator,
-    value: JsonValue,
+    value: Value,
 
-    pub fn init(allocator: Allocator, value: JsonValue) JsonRoot {
-        return .{
-            .allocator = allocator,
-            .value = value,
-        };
-    }
-
-    pub fn deinit(self: *JsonRoot) void {
-        self.value.deinit(self.allocator);
-    }
-
-    pub fn newObject(self: *JsonRoot) !JsonValue {
-        const ptr = try self.allocator.create(std.array_hash_map.String(JsonValue));
-        ptr.* = std.array_hash_map.String(JsonValue).init(self.allocator);
-        return JsonValue{ .object = ptr };
-    }
-
-    pub fn newArray(self: *JsonRoot) !JsonValue {
-        const ptr = try self.allocator.create(std.ArrayList(JsonValue));
-        ptr.* = .empty;
-        return JsonValue{ .array = ptr };
+    pub fn deinit(self: *JsonRoot, allocator: Allocator) void {
+        self.value.deinit(allocator);
     }
 };
 
@@ -439,41 +431,41 @@ pub const CONFIG_RFC8259 = ParserConfig{ .parserType = ParserType.rfc8259 };
 pub const CONFIG_JSON5 = ParserConfig{ .parserType = ParserType.json5 };
 
 /// "Constant" for JSON true value
-var JSON_TRUE = JsonValue{ .boolean = true };
+var JSON_TRUE: Value = .{ .boolean = true };
 
 /// "Constant" for JSON false value
-var JSON_FALSE = JsonValue{ .boolean = false };
+var JSON_FALSE: Value = .{ .boolean = false };
 
 /// "Constant" for JSON null value
-var JSON_NULL = JsonValue{ .nil = @as(void, undefined) };
+var JSON_NULL: Value = .{ .nil = @as(void, undefined) };
 
 /// "Constant" for JSON positive infinity
-var JSON_POSITIVE_INFINITY = JsonValue{ .float = std.math.inf(f64) };
+var JSON_POSITIVE_INFINITY: Value = .{ .float = std.math.inf(f64) };
 
 /// "Constant" for JSON negative infinity
-var JSON_NEGATIVE_INFINITY = JsonValue{ .float = -std.math.inf(f64) };
+var JSON_NEGATIVE_INFINITY: Value = .{ .float = -std.math.inf(f64) };
 
 /// "Constant" for JSON positive NaN
-var JSON_POSITIVE_NAN = JsonValue{ .float = std.math.nan(f64) };
+var JSON_POSITIVE_NAN: Value = .{ .float = std.math.nan(f64) };
 
 /// "Constant" for JSON negative NaN
-var JSON_NEGATIVE_NAN = JsonValue{ .float = -std.math.nan(f64) };
+var JSON_NEGATIVE_NAN: Value = .{ .float = -std.math.nan(f64) };
 
 /// Parse a JSON5 string using the provided allocator
 pub fn parse(allocator: Allocator, jsonString: []const u8) !JsonRoot {
     _, const value = try parseValue(allocator, jsonString, CONFIG_RFC8259);
-    return JsonRoot.init(allocator, value);
+    return .{ .value = value };
 }
 
 /// Parse a JSON5 string using the provided allocator
 pub fn parseJson5(allocator: Allocator, jsonString: []const u8) !JsonRoot {
     _, const value = try parseValue(allocator, jsonString, CONFIG_JSON5);
-    return JsonRoot.init(allocator, value);
+    return .{ .value = value };
 }
 
 /// Parse a JSON value from the provided slice
 /// Returns the index of the next character to read
-fn parseValue(allocator: Allocator, buffer: []const u8, comptime config: ParserConfig) ParseErrors!struct { usize, JsonValue } {
+fn parseValue(allocator: Allocator, buffer: []const u8, comptime config: ParserConfig) ParseErrors!struct { usize, Value } {
     if (buffer.len == 0) return error.ParseValueError;
     var pos: usize = try trimLeftWhitespace(buffer, config);
     const char = buffer[pos];
@@ -548,12 +540,12 @@ fn parseValue(allocator: Allocator, buffer: []const u8, comptime config: ParserC
 /// Returns the index of the next character to read
 /// Note: parseObject _assumes_ the leading { has been stripped and jsonString
 ///  starts after that point.
-fn parseObject(allocator: Allocator, buffer: []const u8, comptime config: ParserConfig) ParseErrors!struct { usize, JsonValue } {
-    const ptr = try allocator.create(std.array_hash_map.String(JsonValue));
+fn parseObject(allocator: Allocator, buffer: []const u8, comptime config: ParserConfig) ParseErrors!struct { usize, Value } {
+    const ptr = try allocator.create(std.array_hash_map.String(Value));
     ptr.* = .empty;
-    const jsonValue = JsonValue{ .object = ptr };
-    const jsonObject = jsonValue.object;
-    errdefer jsonValue.deinit(allocator);
+    const json_value: Value = .{ .object = ptr };
+    const json_object = json_value.object;
+    errdefer json_value.deinit(allocator);
 
     var wasLastComma = false;
     var closed = false;
@@ -576,7 +568,7 @@ fn parseObject(allocator: Allocator, buffer: []const u8, comptime config: Parser
             continue;
         }
 
-        if (jsonObject.count() > 0 and !wasLastComma) {
+        if (json_object.count() > 0 and !wasLastComma) {
             debug("Unexpected token; expected ',' but found a '{c}' instead", .{buffer[pos]});
             return error.UnexpectedTokenError;
         }
@@ -610,7 +602,7 @@ fn parseObject(allocator: Allocator, buffer: []const u8, comptime config: Parser
         const read_pos, const value = try parseValue(allocator, buffer[pos..], config);
         errdefer value.deinit(allocator);
         pos += read_pos;
-        try jsonObject.put(allocator, key_string, value);
+        try json_object.put(allocator, key_string, value);
     }
 
     if (!closed) {
@@ -621,19 +613,19 @@ fn parseObject(allocator: Allocator, buffer: []const u8, comptime config: Parser
     // Account for the terminal character
     pos += 1;
 
-    return .{ pos, jsonValue };
+    return .{ pos, json_value };
 }
 
 /// Parse a JSON array from the provided slice
 /// Returns the index of the next character to read
 /// Note: parseArray _assumes_ the leading [ has been stripped and jsonString
 ///  starts after that point.
-fn parseArray(allocator: Allocator, buffer: []const u8, comptime config: ParserConfig) ParseErrors!struct { usize, JsonValue } {
-    const ptr = try allocator.create(std.ArrayList(JsonValue));
+fn parseArray(allocator: Allocator, buffer: []const u8, comptime config: ParserConfig) ParseErrors!struct { usize, Value } {
+    const ptr = try allocator.create(std.ArrayList(Value));
     ptr.* = .empty;
-    const jsonValue = JsonValue{ .array = ptr };
-    const jsonArray = jsonValue.array;
-    errdefer jsonValue.deinit(allocator);
+    const json_value: Value = .{ .array = ptr };
+    const json_array = json_value.array;
+    errdefer json_value.deinit(allocator);
 
     // Flag to indicate if we've already seen a comma
     var wasLastComma = false;
@@ -656,7 +648,7 @@ fn parseArray(allocator: Allocator, buffer: []const u8, comptime config: ParserC
         const read_pos, const value = try parseValue(allocator, buffer[pos..], config);
         errdefer value.deinit(allocator);
         pos += read_pos;
-        try jsonArray.append(allocator, value);
+        try json_array.append(allocator, value);
     }
 
     if (wasLastComma and config.parserType != ParserType.json5) return error.UnexpectedTokenError;
@@ -664,7 +656,7 @@ fn parseArray(allocator: Allocator, buffer: []const u8, comptime config: ParserC
     // Account for the terminal character
     pos += 1;
 
-    return .{ pos, jsonValue };
+    return .{ pos, json_value };
 }
 
 fn findNextChar(buffer: []const u8, target: []const u8) usize {
@@ -676,7 +668,7 @@ fn findNextChar(buffer: []const u8, target: []const u8) usize {
 
 /// Parse a string from the provided slice
 /// Returns the index of the next character to read
-fn parseStringWithTerminal(allocator: Allocator, buffer: []const u8, comptime config: ParserConfig, terminal: u8) ParseErrors!struct { usize, JsonValue } {
+fn parseStringWithTerminal(allocator: Allocator, buffer: []const u8, comptime config: ParserConfig, terminal: u8) ParseErrors!struct { usize, Value } {
     const ipos = try expectUpTo(buffer, config, terminal);
     var characters: std.ArrayList(u8) = .empty;
     defer characters.deinit(allocator);
@@ -736,7 +728,7 @@ fn parseStringWithTerminal(allocator: Allocator, buffer: []const u8, comptime co
 
 /// Parse a number from the provided slice
 /// Returns the index of the next character to read
-fn parseNumber(allocator: Allocator, buffer: []const u8, comptime config: ParserConfig) ParseErrors!struct { usize, JsonValue } {
+fn parseNumber(allocator: Allocator, buffer: []const u8, comptime config: ParserConfig) ParseErrors!struct { usize, Value } {
     var encodingType = NumberEncoding.integer;
     var pos = try trimLeftWhitespace(buffer, config);
     var startingDigitAt: usize = 0;
@@ -884,7 +876,7 @@ fn parseNumber(allocator: Allocator, buffer: []const u8, comptime config: Parser
 }
 
 // TODO: Drop the JsonValue return
-fn parseEcmaScript51Identifier(allocator: Allocator, buffer: []const u8) ParseErrors!struct { usize, JsonValue } {
+fn parseEcmaScript51Identifier(allocator: Allocator, buffer: []const u8) ParseErrors!struct { usize, Value } {
     var characters: std.ArrayList(u8) = .empty;
     defer characters.deinit(allocator);
 
@@ -1156,20 +1148,20 @@ test "parse can parse a number" {
     try std.testing.expect(root.value == .integer);
     try std.testing.expectEqual(root.value.asInteger(), 0);
 
-    root.deinit();
+    root.deinit(allocator);
 
     root = try parse(allocator, "0.1");
     try std.testing.expect(root.value == .float);
     try std.testing.expectEqual(root.value.asFloat(), 0.1);
 
-    root.deinit();
+    root.deinit(allocator);
 }
 
 test "parse can parse a object" {
     const allocator = std.testing.allocator;
 
     var root = try parse(allocator, "{\"foo\":\"bar\"}");
-    defer root.deinit();
+    defer root.deinit(allocator);
     try std.testing.expect(root.value == .object);
 }
 
@@ -1177,7 +1169,7 @@ test "parse can parse a array" {
     const allocator = std.testing.allocator;
 
     var root = try parse(allocator, "[0,\"foo\",1.337]");
-    defer root.deinit();
+    defer root.deinit(allocator);
     try std.testing.expect(root.value == .array);
     try std.testing.expectEqual(root.value.get(0).asInteger(), 0);
     try std.testing.expect(std.mem.eql(u8, root.value.get(1).asString(), "foo"));
@@ -1197,7 +1189,7 @@ test "parse can parse an object" {
     try std.testing.expectEqualStrings("foo", keys[0]);
     try std.testing.expectEqualStrings("zig", keys[1]);
 
-    root.deinit();
+    root.deinit(allocator);
 }
 
 test "RFC8259.3: parseValue can parse true" {
@@ -2057,7 +2049,7 @@ test "README.md simple test" {
 
     try std.testing.expectEqual(bazObj.get("baz").asFloat(), -13e+37);
 
-    defer root.deinit();
+    defer root.deinit(allocator);
 }
 
 test "README.md simple test json5" {
@@ -2092,7 +2084,7 @@ test "README.md simple test json5" {
 
     try std.testing.expectEqual(bazObj.get("baz").asFloat(), -13e+37);
 
-    defer root.deinit();
+    defer root.deinit(allocator);
 }
 
 // TODO: For stream implementation
@@ -2118,7 +2110,7 @@ test "README.md simple test with stream source" {
         \\}
     ;
     var root = try parseJson5(allocator, source);
-    defer root.deinit();
+    defer root.deinit(allocator);
 
     const bazObj = root.value.get("foo").get(4);
 
@@ -2246,7 +2238,7 @@ test "README.md simple test from file" {
     defer allocator.free(content);
 
     var root = try parse(allocator, content);
-    defer root.deinit();
+    defer root.deinit(allocator);
 
     const bazObj = root.value.get("foo").get(4);
 
@@ -2262,13 +2254,10 @@ test "README.md simple test from file" {
 test "Custom Json Insert - Array" {
     const allocator = std.testing.allocator;
 
-    const ptr = try allocator.create(std.ArrayList(JsonValue));
+    const ptr = try allocator.create(std.ArrayList(Value));
     ptr.* = .empty;
-    var root = JsonRoot.init(allocator, JsonValue{
-        .array = ptr,
-    });
-    defer root.deinit();
-
+    var root: JsonRoot = .{ .value = .{ .array = ptr } };
+    defer root.deinit(allocator);
     _ = try root.value.append(allocator, .{ .static_string = "foo" });
     _ = try root.value.append(allocator, .{ .static_string = "foo" });
     _ = try root.value.append(allocator, .{ .static_string = "foo" });
@@ -2284,12 +2273,10 @@ test "Custom Json Insert - Array" {
 test "Custom Json Insert - Object" {
     const allocator = std.testing.allocator;
 
-    const ptr = try allocator.create(std.array_hash_map.String(JsonValue));
+    const ptr = try allocator.create(std.array_hash_map.String(Value));
     ptr.* = .empty;
-    var root = JsonRoot.init(allocator, JsonValue{
-        .object = ptr,
-    });
-    defer root.deinit();
+    var root: JsonRoot = .{ .value = .{ .object = ptr } };
+    defer root.deinit(allocator);
 
     try root.value.set(allocator, "test", .{ .static_string = "foo" });
     try root.value.set(allocator, "test", .{ .static_string = "foo" });
